@@ -133,6 +133,8 @@ pub fn bindTableWith(io: std.Io, a: std.mem.Allocator, dir: []const u8, table: *
 /// The settings a plugin's parse reads: the pack's per-model `stream_experts`, which decides the caps of a pack that
 /// can stream (`buf` holds the text).
 fn parseSettings(a: std.mem.Allocator, io: std.Io, buf: []u8, model_dir: []const u8) []const u8 {
+    // A library inside another program reads no model-settings.json (`src/embed_lib.zig`).
+    if (comptime @hasDecl(@import("root"), "mlx_serve_embedded")) return "";
     var path: [std.fs.max_path_bytes]u8 = undefined;
     var s = model_settings.load(a, io, model_settings.defaultPath(&path));
     defer s.deinit();
