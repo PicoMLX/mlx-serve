@@ -20,7 +20,17 @@ pub const log = @import("sdk/util/log.zig");
 /// Marks a library inside another program: the engine reads none of the user's mlx-serve settings (`~/.mlx-serve`).
 pub const mlx_serve_embedded = true;
 
+test {
+    _ = @import("pico_engine.zig");
+}
+
+/// The test process caps MLX's buffer pool as the library does on open; `build/test_runner.zig` calls it first.
+fn testProcessInit() callconv(.c) void {
+    @import("mlx/state.zig").applyMlxCacheLimit();
+}
+
 comptime {
+    if (@import("builtin").is_test) @export(&testProcessInit, .{ .name = "msv_test_process_init" });
     _ = @import("pico_engine.zig");
     // One compile unit: the MLX engine's table (`mlx_serve_mlx_api`, which its own code calls through) is here.
     _ = @import("engines/mlx/api.zig");
@@ -53,7 +63,7 @@ pub fn ensureInit() void {
     initialized.store(true, .release);
 }
 
-export fn pico_ms_abi_version() i32 {
+pub export fn pico_ms_abi_version() i32 {
     return 2;
 }
 

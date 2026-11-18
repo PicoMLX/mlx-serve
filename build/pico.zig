@@ -101,13 +101,8 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     // Only what the exported functions reach stays.
     link.addArg("-Wl,-dead_strip");
     link.addFileArg(obj.getEmittedBin());
-    for (stubs) |src| link.addFileArg(compile(b, min, &.{ "-x", "c", "-std=c11" }, src));
-    // The expert stream's C side (`libs.addStreamSources`), against the static stage's headers.
-    link.addFileArg(compile(b, min, &.{ "-x", "c", "-std=c11", "-pthread" }, stream_csrc ++ "/q3_lookahead4_exl3.c"));
-    link.addFileArg(compile(b, min, &.{ "-x", "objective-c++", "-fno-objc-arc" }, stream_csrc ++ "/q3_event_shim.mm"));
-    for ([_][]const u8{ "/mlx_event_shim.cpp", "/mlx_alloc_shim.cpp" }) |src|
-        link.addFileArg(compile(b, min, &.{ "-x", "c++", "-std=c++20", "-D_METAL_", "-DACCELERATE_NEW_LAPACK", "-Wno-deprecated-declarations" }, b.fmt("{s}{s}", .{ stream_csrc, src })));
-    for (archives) |a| link.addFileArg(b.path(b.fmt("{s}/{s}", .{ stage, a })));
+    const inputs = linkInputs(b, min);
+    for (inputs) |input| link.addFileArg(input);
     for (frameworks) |f| link.addArgs(&.{ "-framework", f });
     link.addArg("-o");
     const dylib = link.addOutputFileArg("libPicoMlxServe.dylib");
@@ -115,4 +110,53 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     const step = b.step("pico-lib", "Build libPicoMlxServe.dylib: a C interface over a private, statically linked MLX");
     step.dependOn(&b.addInstallFileWithDir(dylib, .lib, "libPicoMlxServe.dylib").step);
     step.dependOn(&b.addInstallFileWithDir(b.path(stage ++ "/mlx.metallib"), .lib, "mlx.metallib").step);
+
+    // `pico-test`: the engine's tests (`src/pico_engine.zig`), linked as the library is and run beside mlx.metallib
+    // (`PICO_MS_TEST_MODEL=<dir>` adds the ones that need a model).
+    const tests = b.addTest(.{
+        .name = "pico-ms-test",
+        .root_module = mod,
+        .emit_object = true,
+        .filters = &.{"pico_ms"},
+        .test_runner = .{ .path = b.path("build/test_runner.zig"), .mode = .simple },
+    });
+    tests.bundle_compiler_rt = true;
+    const test_link = b.addSystemCommand(&.{ "xcrun", "--sdk", "macosx", "clang++", "-arch", "arm64" });
+    test_link.addArg(b.fmt("-mmacosx-version-min={d}.{d}", .{ min.major, min.minor }));
+    test_link.addArg("-Wl,-dead_strip");
+    test_link.addFileArg(tests.getEmittedBin());
+    for (inputs) |input| test_link.addFileArg(input);
+    // A test object leaves out Zig's compiler runtime (the runner's f128 formatting needs it): an archive of it alone.
+    const rt = b.addLibrary(.{ .name = "pico_test_rt", .linkage = .static, .root_module = b.createModule(.{
+        .root_source_file = b.addWriteFiles().add("rt.zig", ""),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    rt.bundle_compiler_rt = true;
+    test_link.addFileArg(rt.getEmittedBin());
+    for (frameworks) |f| test_link.addArgs(&.{ "-framework", f });
+    test_link.addArg("-o");
+    // MLX finds mlx.metallib beside the image its code is in: the test binary's.
+    const test_dir = b.addWriteFiles();
+    const test_exe = test_dir.addCopyFile(test_link.addOutputFileArg("pico-ms-test"), "pico-ms-test");
+    _ = test_dir.addCopyFile(b.path(stage ++ "/mlx.metallib"), "mlx.metallib");
+    const run = b.addSystemCommand(&.{"/usr/bin/env"});
+    run.addFileArg(test_exe);
+    run.has_side_effects = true;
+    const test_step = b.step("pico-test", "Run libPicoMlxServe's engine tests");
+    test_step.dependOn(&run.step);
+}
+
+/// What the library links beside its own object: the "unavailable" stubs, the expert stream's C side
+/// (`libs.addStreamSources`) compiled against the static stage's headers, and the static MLX.
+fn linkInputs(b: *std.Build, min: std.SemanticVersion) []const std.Build.LazyPath {
+    var list: std.ArrayList(std.Build.LazyPath) = .empty;
+    const a = b.allocator;
+    for (stubs) |src| list.append(a, compile(b, min, &.{ "-x", "c", "-std=c11" }, src)) catch @panic("OOM");
+    list.append(a, compile(b, min, &.{ "-x", "c", "-std=c11", "-pthread" }, stream_csrc ++ "/q3_lookahead4_exl3.c")) catch @panic("OOM");
+    list.append(a, compile(b, min, &.{ "-x", "objective-c++", "-fno-objc-arc" }, stream_csrc ++ "/q3_event_shim.mm")) catch @panic("OOM");
+    for ([_][]const u8{ "/mlx_event_shim.cpp", "/mlx_alloc_shim.cpp" }) |src|
+        list.append(a, compile(b, min, &.{ "-x", "c++", "-std=c++20", "-D_METAL_", "-DACCELERATE_NEW_LAPACK", "-Wno-deprecated-declarations" }, b.fmt("{s}{s}", .{ stream_csrc, src }))) catch @panic("OOM");
+    for (archives) |name| list.append(a, b.path(b.fmt("{s}/{s}", .{ stage, name }))) catch @panic("OOM");
+    return list.items;
 }
