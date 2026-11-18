@@ -8,6 +8,7 @@ const kit = @import("build/kit.zig");
 const lint = @import("build/lint.zig");
 const linux = @import("build/linux.zig");
 const macos = @import("build/macos.zig");
+const pico = @import("build/pico.zig");
 const plugins = @import("build/plugins.zig");
 const standalone = @import("build/standalone.zig");
 
@@ -38,6 +39,11 @@ pub fn build(b: *std.Build) void {
         } else .{},
     });
     const optimize = b.standardOptimizeOption(.{});
+
+    // `pico-lib`: libPicoMlxServe.dylib, a library with its own private MLX. It links lib/mlx-static and none of the
+    // server's stages, so `-Dpico-only` stops here: a tree without lib/mlx, webp, llama or ds4 can build it.
+    pico.add(b, target, optimize);
+    if (b.option(bool, "pico-only", "Register `pico-lib` alone, skipping the server graph and its staged-dependency checks") orelse false) return;
 
     // `-Dunits` (the macOS default): the host, the MLX engine and every plugin group compile as their own objects, in
     // parallel, none of them needing the whole tree's compiler memory. `-Dunits=false` builds one unit.

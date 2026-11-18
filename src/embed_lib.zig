@@ -1,0 +1,102 @@
+//! Root of libPicoMlxServe.dylib (`zig build pico-lib`, build/pico.zig): a C interface over an MLX that lives inside
+//! the library. mlx + mlx-c are linked in statically and the final link exports only the `pico_ms_*` functions below,
+//! so a host process that already holds another MLX (Swift MLX, linked statically) keeps its own: the two copies share
+//! no symbol, no allocator and no Metal library.
+//!
+//! Loading the library runs none of this file's code and changes nothing process-wide: no signal handler, no memory or
+//! wired limit, no environment variable. mlx-c's error handler (state inside this library's mlx-c) is set on the first
+//! call, since its default prints and calls `exit`.
+
+const std = @import("std");
+const mlx = @import("mlx/ffi.zig");
+const os_mutex = @import("sdk/util/os_mutex.zig");
+
+// Prints the message and traps: a panic in a library has no business symbolizing the host's stack.
+pub const panic = std.debug.simple_panic;
+
+var init_mutex: os_mutex.Mutex = .{};
+var initialized: std.atomic.Value(bool) = .init(false);
+/// The MLX version, copied out of mlx-c once; empty when mlx-c could not report it.
+var version_buf: [64:0]u8 = @splat(0);
+
+fn ensureInit() void {
+    if (initialized.load(.acquire)) return;
+    init_mutex.lock();
+    defer init_mutex.unlock();
+    if (initialized.load(.monotonic)) return;
+    mlx.mlx_set_error_handler(onMlxError, null, null);
+    var str = mlx.mlx_string_new();
+    defer _ = mlx.mlx_string_free(str);
+    if (mlx.mlx_version(&str) == 0) {
+        const text = std.mem.span(mlx.mlx_string_data(str));
+        const len = @min(text.len, version_buf.len);
+        @memcpy(version_buf[0..len], text[0..len]);
+    }
+    initialized.store(true, .release);
+}
+
+/// mlx-c reports a caught MLX exception here, on the calling thread, and then returns non-zero from the call.
+fn onMlxError(msg: [*:0]const u8, _: ?*anyopaque) callconv(.c) void {
+    const prefix = "pico_ms: MLX error: ";
+    _ = std.c.write(2, prefix, prefix.len);
+    _ = std.c.write(2, msg, std.mem.len(msg));
+    _ = std.c.write(2, "\n", 1);
+}
+
+export fn pico_ms_abi_version() i32 {
+    return 1;
+}
+
+/// The version of the MLX inside this library; static storage.
+export fn pico_ms_mlx_version() [*:0]const u8 {
+    ensureInit();
+    return &version_buf;
+}
+
+/// Builds A, an n×n float32 matrix of 1/n, on the default GPU stream, multiplies P = A by A `rounds` times (A is
+/// idempotent, so P stays A), evaluates it and returns the sum of P's elements: n. NaN on any failure.
+export fn pico_ms_smoke(n: i32, rounds: i32) f64 {
+    return smoke(n, rounds) catch std.math.nan(f64);
+}
+
+fn smoke(n: i32, rounds: i32) !f64 {
+    if (n <= 0 or rounds < 0) return error.InvalidArgument;
+    ensureInit();
+    // The calling thread's own default GPU stream: MLX keeps default streams per thread.
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    // Empty when MLX could not bring the GPU up (no Metal device, or no mlx.metallib beside the library).
+    if (s.ctx == null) return error.MlxError;
+
+    const fill = mlx.mlx_array_new_float(1.0 / @as(f32, @floatFromInt(n)));
+    defer _ = mlx.mlx_array_free(fill);
+    var a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a);
+    const shape = [_]c_int{ n, n };
+    try mlx.check(mlx.mlx_full(&a, &shape, shape.len, fill, .float32, s));
+
+    var p = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(p);
+    try mlx.check(mlx.mlx_array_set(&p, a));
+    for (0..@intCast(rounds)) |_| try mlx.check(mlx.mlx_matmul(&p, p, a, s));
+
+    var total = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(total);
+    try mlx.check(mlx.mlx_sum(&total, p, false, s));
+    try mlx.check(mlx.mlx_array_eval(total));
+    var value: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&value, total));
+    return value;
+}
+
+/// This MLX's active, cache and peak bytes into `out[0..3]`. 0 on success.
+export fn pico_ms_memory(out: ?*[3]i64) i32 {
+    const o = out orelse return -1;
+    ensureInit();
+    var bytes: [3]usize = undefined;
+    if (mlx.mlx_get_active_memory(&bytes[0]) != 0) return -1;
+    if (mlx.mlx_get_cache_memory(&bytes[1]) != 0) return -1;
+    if (mlx.mlx_get_peak_memory(&bytes[2]) != 0) return -1;
+    for (o, bytes) |*dst, b| dst.* = @intCast(b);
+    return 0;
+}
