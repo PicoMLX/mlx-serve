@@ -55,6 +55,25 @@ fn theIo() std.Io {
     return threaded.io();
 }
 
+/// `f(args)` on a thread of the library's own, started for the call and joined before it returns; null when the
+/// thread could not start. A pack's config parse alone takes over 1 MB of stack, and a caller may have 512 KB (a
+/// Grand Central Dispatch or Swift concurrency thread): what parses a config, or loads or frees a model, runs here.
+/// The calls left on the caller's thread stay under 64 KB.
+fn onOwnStack(comptime R: type, comptime f: anytype, args: anytype) ?R {
+    const Call = struct {
+        args: @TypeOf(args),
+        result: R = undefined,
+
+        fn run(c: *@This()) void {
+            c.result = @call(.auto, f, c.args);
+        }
+    };
+    var call: Call = .{ .args = args };
+    const t = std.Thread.spawn(.{}, Call.run, .{&call}) catch return null;
+    t.join();
+    return call.result;
+}
+
 /// Guards `open_engine` and the once-per-process settings.
 var open_mutex: @import("sdk/util/os_mutex.zig").Mutex = .{};
 var open_engine: ?*Engine = null;
@@ -260,17 +279,19 @@ fn loadBytes(io: std.Io, dir: []const u8) !u64 {
     return if (bytes == 0) error.WeightsMissing else bytes;
 }
 
+/// The bytes loading the pack at `dir` takes, -1 when this library does not serve it.
+fn loadBytesOf(dir: []const u8) i64 {
+    return @intCast(loadBytes(theIo(), dir) catch return -1);
+}
+
 export fn pico_ms_can_serve(model_dir: ?[*:0]const u8) i32 {
-    lib.ensureInit();
-    const dir = dirOf(model_dir) orelse return 0;
-    _ = loadBytes(theIo(), dir) catch return 0;
-    return 1;
+    return @intFromBool(pico_ms_load_bytes(model_dir) >= 0);
 }
 
 export fn pico_ms_load_bytes(model_dir: ?[*:0]const u8) i64 {
     lib.ensureInit();
     const dir = dirOf(model_dir) orelse return -1;
-    return @intCast(loadBytes(theIo(), dir) catch return -1);
+    return onOwnStack(i64, loadBytesOf, .{dir}) orelse -1;
 }
 
 // ── open, close
@@ -303,6 +324,10 @@ fn fail(err: ?[*]u8, err_len: i32, comptime fmt: []const u8, args: anytype) ?*an
 export fn pico_ms_open(model_dir: ?[*:0]const u8, err: ?[*]u8, err_len: i32) ?*anyopaque {
     lib.ensureInit();
     const dir = dirOf(model_dir) orelse return fail(err, err_len, "the model directory must be an absolute path", .{});
+    return onOwnStack(?*anyopaque, openHandle, .{ dir, err, err_len }) orelse fail(err, err_len, "no thread to load the model on", .{});
+}
+
+fn openHandle(dir: []const u8, err: ?[*]u8, err_len: i32) ?*anyopaque {
     open_mutex.lock();
     defer open_mutex.unlock();
     if (open_engine != null) return fail(err, err_len, "a model is already open: this library serves one at a time", .{});
@@ -443,6 +468,11 @@ fn loadError(name: []const u8) anyerror {
 
 export fn pico_ms_close(h: ?*anyopaque) void {
     const e: *Engine = @ptrCast(@alignCast(h orelse return));
+    // Without a thread of its own the model is still closed, on the caller's.
+    onOwnStack(void, closeHandle, .{e}) orelse closeHandle(e);
+}
+
+fn closeHandle(e: *Engine) void {
     const io = e.io;
     {
         e.mu.lockUncancelable(io);
