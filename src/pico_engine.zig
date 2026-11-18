@@ -12,6 +12,10 @@
 //! `pico_ms_cancel`, `pico_ms_tokenize`, `pico_ms_detokenize`, `pico_ms_model_memory`, `pico_ms_can_serve` and
 //! `pico_ms_load_bytes` work there as anywhere.
 //!
+//! Once `pico_ms_close` has begun, a new submission, tokenize, detokenize or trim on the handle is refused, and close
+//! frees nothing while one that began earlier is still inside. A call that begins after close has returned is the
+//! caller's error: the handle is gone.
+//!
 //! What opening a model leaves alone: no signal handler (the `Io` is `init_single_threaded`'s, which installs
 //! none), no environment variable, no listener, no outside plugin, no sleep assertion, and nothing written outside
 //! MLX and Metal's own doing: the warm-up marker, the SSD prefix cache and the round-cost table stay off, and
@@ -89,6 +93,10 @@ var process_configured = false;
 /// refused there (`pico_ms_close`, `pico_ms_trim`, `pico_ms_submit`, `pico_ms_open`).
 threadlocal var in_callback = false;
 
+fn release(r: *Request) void {
+    if (r.refs.fetchSub(1, .acq_rel) == 1) r.alloc.destroy(r);
+}
+
 fn deliver(r: *Request, tokens: ?[*]const i32, n: i32, status: i32, usage: ?*const [6]i64) void {
     in_callback = true;
     defer in_callback = false;
@@ -101,6 +109,8 @@ const Status = enum(i32) { stopped = 0, cancelled = 1, failed = 2, length = 3 };
 
 const Request = struct {
     engine: *Engine,
+    /// The engine's, copied: the last owner may let go after the engine is freed.
+    alloc: std.mem.Allocator,
     id: u64,
     cb: EventCb,
     ctx: ?*anyopaque,
@@ -142,6 +152,12 @@ const Engine = struct {
     /// Requests past their final callback whose slot the reaper still hands back.
     done: std.ArrayList(*Request) = .empty,
     reaping: u32 = 0,
+    /// Calls inside the engine past its lock: a submission from `track` until it has published or been refused, a
+    /// tokenize, a detokenize, a trim. Close frees nothing while any is.
+    users: u32 = 0,
+    /// Close has begun: no request, tokenize, detokenize or trim is taken.
+    closing: bool = false,
+    /// Close has drained: the reaper ends.
     stop: bool = false,
     reaper: ?std.Thread = null,
 
@@ -163,25 +179,45 @@ const Engine = struct {
     fn drain(e: *Engine) void {
         e.mu.lockUncancelable(e.io);
         defer e.mu.unlock(e.io);
+        e.closing = true;
         for (e.live.items) |r| cancelLocked(r);
-        while (e.live.items.len > 0 or e.done.items.len > 0 or e.reaping > 0) e.cond.waitUncancelable(e.io, &e.mu);
+        while (e.live.items.len > 0 or e.done.items.len > 0 or e.reaping > 0 or e.users > 0) e.cond.waitUncancelable(e.io, &e.mu);
         e.stop = true;
         e.cond.broadcast(e.io);
     }
 
     fn newRequest(e: *Engine, id: u64, cb: EventCb, ctx: ?*anyopaque) !*Request {
         const r = try e.alloc.create(Request);
-        r.* = .{ .engine = e, .id = id, .cb = cb, .ctx = ctx, .submitter = std.Thread.getCurrentId() };
+        r.* = .{ .engine = e, .alloc = e.alloc, .id = id, .cb = cb, .ctx = ctx, .submitter = std.Thread.getCurrentId() };
         return r;
     }
 
-    /// Takes `r` into the live set; false, and nothing changed, when the engine is closing or `r.id` is live.
+    /// Takes `r` into the live set, its submitter one of the engine's users until `publish` or `untrack`; false, and
+    /// nothing changed, when the engine is closing or `r.id` is live.
     fn track(e: *Engine, r: *Request) bool {
         e.mu.lockUncancelable(e.io);
         defer e.mu.unlock(e.io);
-        if (e.stop or e.findLive(r.id) != null) return false;
+        if (e.closing or e.stop or e.findLive(r.id) != null) return false;
         e.live.append(gpa, r) catch return false;
+        e.users += 1;
         return true;
+    }
+
+    /// A call that uses the engine past its lock begins; false once close has begun.
+    fn enter(e: *Engine) bool {
+        e.mu.lockUncancelable(e.io);
+        defer e.mu.unlock(e.io);
+        if (e.closing) return false;
+        e.users += 1;
+        return true;
+    }
+
+    /// That call is done with the engine: its last touch of it.
+    fn leave(e: *Engine) void {
+        e.mu.lockUncancelable(e.io);
+        defer e.mu.unlock(e.io);
+        e.users -= 1;
+        e.cond.broadcast(e.io);
     }
 
     /// A submission refused after `track`: no event of `r` was passed on and none follows. Wakes a close waiting for
@@ -192,9 +228,10 @@ const Engine = struct {
             _ = e.live.swapRemove(i);
             break;
         };
+        e.users -= 1;
         e.cond.broadcast(e.io);
         e.mu.unlock(e.io);
-        e.alloc.destroy(r);
+        r.alloc.destroy(r);
     }
 
     /// The submitter's last word on `r`: the slot the scheduler gave it, unless `r` has finished (the slot may then
@@ -207,12 +244,11 @@ const Engine = struct {
                 r.slot = slot;
                 if (r.cancel_wanted) cancelLocked(r);
             }
+            // The submitter is done with the engine: close may free it once the lock is let go.
+            e.users -= 1;
+            e.cond.broadcast(e.io);
         }
-        e.release(r);
-    }
-
-    fn release(e: *Engine, r: *Request) void {
-        if (r.refs.fetchSub(1, .acq_rel) == 1) e.alloc.destroy(r);
+        release(r);
     }
 
     /// `r`'s final callback has returned: it leaves the live set, and the reaper hands its slot back.
@@ -241,7 +277,7 @@ const Engine = struct {
 
     /// The reaper has handed `r`'s slot back to the scheduler.
     fn reaped(e: *Engine, r: *Request) void {
-        e.release(r);
+        release(r);
         e.mu.lockUncancelable(e.io);
         defer e.mu.unlock(e.io);
         e.reaping -= 1;
@@ -605,6 +641,8 @@ export fn pico_ms_tokenize(h: ?*anyopaque, text: ?[*]const u8, len: i32, out: ?[
     if (len < 0 or (len > 0 and text == null)) return -1;
     const bytes: []const u8 = if (len > 0) text.?[0..@intCast(len)] else "";
     if (!std.unicode.utf8ValidateSlice(bytes)) return -1;
+    if (!e.enter()) return -1;
+    defer e.leave();
     const ids = e.tok().encode(gpa, bytes) catch return -1;
     defer gpa.free(ids);
     if (ids.len > std.math.maxInt(i32)) return -1;
@@ -620,6 +658,8 @@ export fn pico_ms_detokenize(h: ?*anyopaque, tokens: ?[*]const i32, n: i32, out:
     if (n < 0 or (n > 0 and tokens == null)) return -1;
     const ids: []const u32 = if (n > 0) @ptrCast(tokens.?[0..@intCast(n)]) else &.{};
     for (ids) |id| if (id > std.math.maxInt(i32)) return -1;
+    if (!e.enter()) return -1;
+    defer e.leave();
     const text = e.tok().decode(gpa, ids, false) catch return -1;
     defer gpa.free(text);
     if (text.len > std.math.maxInt(i32)) return -1;
@@ -647,7 +687,7 @@ export fn pico_ms_submit(h: ?*anyopaque, id: u64, prompt: ?[*]const i32, n: i32,
 
     const r = e.newRequest(id, callback, ctx) catch return 1;
     if (!e.track(r)) {
-        e.alloc.destroy(r);
+        r.alloc.destroy(r);
         return 1;
     }
     // What the server asks before it queues a prompt: whether its prefill and reply fit in memory now.
@@ -718,6 +758,8 @@ export fn pico_ms_trim(h: ?*anyopaque, want_bytes: i64) i64 {
     // The trim runs on the inference thread, which is running this callback.
     if (in_callback) return -1;
     if (want_bytes <= 0) return 0;
+    if (!e.enter()) return 0;
+    defer e.leave();
     const before = heldBytes();
     // The scheduler clears MLX's pool itself once the job has run.
     var job: requests.GenRequest = .{ .ctx = e, .run = dropPrefixCache, .model = e.entry };
@@ -827,6 +869,82 @@ test "pico_ms: a submission refused while close waits does not leave close waiti
     try testing.expect(e.stop);
 }
 
+/// Starts `e.drain` (what `pico_ms_close` does first) on a thread of its own.
+const Drain = struct {
+    e: *Engine,
+    done: std.atomic.Value(bool) = .init(false),
+    thread: std.Thread = undefined,
+
+    fn start(d: *Drain) !void {
+        d.thread = try std.Thread.spawn(.{}, run, .{d});
+        // Long enough to be waiting, with the engine's lock released.
+        std.Io.sleep(theIo(), .fromMilliseconds(200), .awake) catch {};
+    }
+
+    fn run(d: *Drain) void {
+        d.e.drain();
+        d.done.store(true, .release);
+    }
+
+    /// Joined once drained within 5 s; else left to its wait.
+    fn finish(d: *Drain) !void {
+        var waited_ms: u32 = 0;
+        while (!d.done.load(.acquire)) : (waited_ms += 10) {
+            if (waited_ms >= 5_000) {
+                d.thread.detach();
+                return error.Deadlocked;
+            }
+            std.Io.sleep(theIo(), .fromMilliseconds(10), .awake) catch {};
+        }
+        d.thread.join();
+    }
+};
+
+test "pico_ms: close does not finish while a submitter whose request already finished has yet to return" {
+    var e = ledgerEngine(gpa);
+    defer e.live.deinit(gpa);
+    defer e.done.deinit(gpa);
+    var slot: Slot = undefined;
+    slot.cancelled = .init(false);
+    const r = try e.newRequest(1, ignoreEvent, null);
+    try testing.expect(e.track(r));
+    var d: Drain = .{ .e = &e };
+    try d.start();
+    // The accepted request is cancelled, finishes and is reaped, all before its submitter reaches `publish`.
+    e.retire(r, &slot);
+    e.reaped(e.takeDone().?);
+    std.Io.sleep(theIo(), .fromMilliseconds(200), .awake) catch {};
+    // Close would free the engine here, under the submitter about to lock it.
+    const early = d.done.load(.acquire);
+    e.publish(r, &slot);
+    try d.finish();
+    try testing.expect(!early);
+}
+
+test "pico_ms: once close has begun, a new submission, tokenize, detokenize and trim are refused" {
+    var e = ledgerEngine(gpa);
+    defer e.live.deinit(gpa);
+    const r1 = try e.newRequest(1, ignoreEvent, null);
+    try testing.expect(e.track(r1));
+    var d: Drain = .{ .e = &e };
+    try d.start();
+    // Close is waiting for request 1, with the engine's lock released.
+    const r2 = try e.newRequest(2, ignoreEvent, null);
+    const accepted = e.track(r2);
+    if (accepted) e.untrack(r2) else r2.alloc.destroy(r2);
+    var ids: [4]i32 = undefined;
+    // The tokenizer and the scheduler belong to an engine close is about to free: none is touched.
+    const tokenized = if (!accepted) pico_ms_tokenize(&e, "a", 1, &ids, ids.len) else -1;
+    const detokenized = if (!accepted) pico_ms_detokenize(&e, &ids, 1, null, 0) else -1;
+    const trimmed = if (!accepted) pico_ms_trim(&e, 1) else 0;
+    e.untrack(r1);
+    try d.finish();
+    try testing.expect(!accepted);
+    try testing.expectEqual(@as(i32, -1), tokenized);
+    try testing.expectEqual(@as(i32, -1), detokenized);
+    try testing.expectEqual(@as(i64, 0), trimmed);
+}
+
 test "pico_ms: a live id is refused, and a closing engine takes no request" {
     var e = ledgerEngine(gpa);
     defer e.live.deinit(gpa);
@@ -834,16 +952,16 @@ test "pico_ms: a live id is refused, and a closing engine takes no request" {
     try testing.expect(e.track(r1));
     const dup = try e.newRequest(7, ignoreEvent, null);
     try testing.expect(!e.track(dup));
-    e.alloc.destroy(dup);
+    dup.alloc.destroy(dup);
     e.untrack(r1);
     // Its id is free again once it has left.
     const again = try e.newRequest(7, ignoreEvent, null);
     try testing.expect(e.track(again));
     e.untrack(again);
-    e.stop = true;
+    e.closing = true;
     const late = try e.newRequest(8, ignoreEvent, null);
     try testing.expect(!e.track(late));
-    e.alloc.destroy(late);
+    late.alloc.destroy(late);
 }
 
 /// An engine whose scheduler runs with no model, as a headless server boots: its inference thread idles and runs
