@@ -1,0 +1,22 @@
+load_default_library collects each lookup's NS::Error in `error[6]` and reads all six to build its
+"Failed to load the default metallib" message, but `error[5]` is only written under SWIFTPM_BUNDLE.
+Without it the read is of an uninitialized pointer: AppleClang 21 at -O3 compiles that path to a
+trap, so a missing mlx.metallib kills the process (SIGTRAP in metal::Device::Device) instead of
+throwing the std::runtime_error mlx-c turns into an error return.
+
+Applied by scripts/build-mlx-static.sh only (libPicoMlxServe.dylib must fail a call, not its host).
+Retires when MLX initializes the array. Not reported upstream yet.
+
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index 6c0c92f..5142fd4 100644
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -223,7 +223,7 @@ MTL::Library* load_default_library(MTL::Device* device) {
+     return lib;
+   }
+ 
+-  NS::Error* error[6];
++  NS::Error* error[6] = {};
+   MTL::Library* lib;
+   // First try the colocated mlx.metallib
+   std::tie(lib, error[0]) = load_colocated_library(device, "mlx");

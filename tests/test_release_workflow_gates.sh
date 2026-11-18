@@ -216,6 +216,13 @@ for name, text in (("release.yml CLI tarball + app bundle", wf_text),
 # Two copies in release.yml: one per artifact (tarball and .app).
 check(wf_text.count("LICENSE-APACHE-2.0") >= 2,
       "release.yml packages the licenses into BOTH the tarball and the .app")
+# libPicoMlxServe.dylib (`zig build pico-lib`) carries the same code: its step installs the texts beside it.
+pico_text = open("build/pico.zig").read()
+pico_notices = re.search(r'const notices = \[_\]\[\]const u8\{([^}]*)\}', pico_text)
+for f in ("LICENSE", "LICENSE-APACHE-2.0", "NOTICE"):
+    check(pico_notices is not None and f'"{f}"' in pico_notices.group(1), f"build/pico.zig installs {f} beside the library")
+check("for (notices) |f| step.dependOn(&b.addInstallFileWithDir(b.path(f), .lib, f).step);" in pico_text,
+      "pico-lib's step installs every notice")
 
 # ── app/build.sh FAST_DEV: an iteration lever must not become a shipping mode.
 # Every fast-dev shortcut (incremental Swift, in-place bundle, reused

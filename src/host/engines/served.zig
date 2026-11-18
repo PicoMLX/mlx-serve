@@ -22,7 +22,8 @@ pub fn table(kind: Kind) ?*const abi.Engine {
         .mlx, .plugin => null,
         .ds4 => if (build_options.ds4_engine) &@import("../../engines/ds4/engine.zig").table else null,
         .llama => if (build_options.llama_engine) &@import("../../engines/llama/engine.zig").table else null,
-        .ane => &@import("../../engines/ane/engine.zig").table,
+        // A build that sets `ane_engine` false leaves the Neural Engine out (libPicoMlxServe, build/pico.zig).
+        .ane => if (@hasDecl(build_options, "ane_engine") and !build_options.ane_engine) null else &@import("../../engines/ane/engine.zig").table,
     };
 }
 
