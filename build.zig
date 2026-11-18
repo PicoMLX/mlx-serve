@@ -40,17 +40,18 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{});
 
-    // `pico-lib`: libPicoMlxServe.dylib, a library with its own private MLX. It links lib/mlx-static and none of the
-    // server's stages, so `-Dpico-only` stops here: a tree without lib/mlx, webp, llama or ds4 can build it.
+    // `pico-lib`: libPicoMlxServe.dylib, a library with its own private MLX and the MLX engine over it. It links
+    // lib/mlx-static and none of the server's stages, so `-Dpico-only` stops once the plugins are registered: a tree
+    // without lib/mlx, webp, llama or ds4 can build it.
     pico.add(b, target, optimize);
+    // A plugin registers by its folder: the scan writes src/plugins/registry.zig, every graph compiles it.
+    const plugin_names = plugins.generate(b);
     if (b.option(bool, "pico-only", "Register `pico-lib` alone, skipping the server graph and its staged-dependency checks") orelse false) return;
 
     // `-Dunits` (the macOS default): the host, the MLX engine and every plugin group compile as their own objects, in
     // parallel, none of them needing the whole tree's compiler memory. `-Dunits=false` builds one unit.
     const units = b.option(bool, "units", "Compile the host, the engine and each plugin group as their own units, in parallel") orelse
         (builtin.os.tag == .macos);
-    // A plugin registers by its folder: the scan writes src/plugins/registry.zig, every graph compiles it.
-    const plugin_names = plugins.generate(b);
 
     // `lint`, `lint-test`, `unit-closure`.
     lint.add(b);

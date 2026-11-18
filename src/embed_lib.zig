@@ -1,15 +1,30 @@
 //! Root of libPicoMlxServe.dylib (`zig build pico-lib`, build/pico.zig): a C interface over an MLX that lives inside
-//! the library. mlx + mlx-c are linked in statically and the final link exports only the `pico_ms_*` functions below,
-//! so a host process that already holds another MLX (Swift MLX, linked statically) keeps its own: the two copies share
-//! no symbol, no allocator and no Metal library.
+//! the library, and over mlx-serve's MLX text-generation engine on top of it (`pico_engine.zig`). mlx + mlx-c are
+//! linked in statically and the final link exports only the `pico_ms_*` functions, so a host process that already
+//! holds another MLX (Swift MLX, linked statically) keeps its own: the two copies share no symbol, no allocator and
+//! no Metal library.
 //!
-//! Loading the library runs none of this file's code and changes nothing process-wide: no signal handler, no memory or
+//! Loading the library runs none of this code and changes nothing process-wide: no signal handler, no memory or
 //! wired limit, no environment variable. mlx-c's error handler (state inside this library's mlx-c) is set on the first
 //! call, since its default prints and calls `exit`.
 
 const std = @import("std");
-const mlx = @import("mlx/ffi.zig");
 const os_mutex = @import("sdk/util/os_mutex.zig");
+
+// What Sushi's EXL3 module reads from its host root (`mlx_host`), as `main.zig` declares them.
+pub const env = @import("env.zig");
+pub const mlx = @import("mlx/ffi.zig");
+pub const io_util = @import("sdk/util/io_util.zig");
+pub const log = @import("sdk/util/log.zig");
+
+/// Marks a library inside another program: the engine reads none of the user's mlx-serve settings (`~/.mlx-serve`).
+pub const mlx_serve_embedded = true;
+
+comptime {
+    _ = @import("pico_engine.zig");
+    // One compile unit: the MLX engine's table (`mlx_serve_mlx_api`, which its own code calls through) is here.
+    _ = @import("engines/mlx/api.zig");
+}
 
 // Prints the message and traps: a panic in a library has no business symbolizing the host's stack.
 pub const panic = std.debug.simple_panic;
@@ -19,12 +34,15 @@ var initialized: std.atomic.Value(bool) = .init(false);
 /// The MLX version, copied out of mlx-c once; empty when mlx-c could not report it.
 var version_buf: [64:0]u8 = @splat(0);
 
-fn ensureInit() void {
+pub fn ensureInit() void {
     if (initialized.load(.acquire)) return;
     init_mutex.lock();
     defer init_mutex.unlock();
     if (initialized.load(.monotonic)) return;
-    mlx.mlx_set_error_handler(onMlxError, null, null);
+    // The engine's handler: it keeps the first failure for the call that reads it and logs each one.
+    mlx.installErrorHandler();
+    // The engine's warnings and errors reach stderr; its running account of loads and requests does not.
+    log.setLevel(.warn);
     var str = mlx.mlx_string_new();
     defer _ = mlx.mlx_string_free(str);
     if (mlx.mlx_version(&str) == 0) {
@@ -35,16 +53,8 @@ fn ensureInit() void {
     initialized.store(true, .release);
 }
 
-/// mlx-c reports a caught MLX exception here, on the calling thread, and then returns non-zero from the call.
-fn onMlxError(msg: [*:0]const u8, _: ?*anyopaque) callconv(.c) void {
-    const prefix = "pico_ms: MLX error: ";
-    _ = std.c.write(2, prefix, prefix.len);
-    _ = std.c.write(2, msg, std.mem.len(msg));
-    _ = std.c.write(2, "\n", 1);
-}
-
 export fn pico_ms_abi_version() i32 {
-    return 1;
+    return 2;
 }
 
 /// The version of the MLX inside this library; static storage.
@@ -56,7 +66,12 @@ export fn pico_ms_mlx_version() [*:0]const u8 {
 /// Builds A, an n×n float32 matrix of 1/n, on the default GPU stream, multiplies P = A by A `rounds` times (A is
 /// idempotent, so P stays A), evaluates it and returns the sum of P's elements: n. NaN on any failure.
 export fn pico_ms_smoke(n: i32, rounds: i32) f64 {
-    return smoke(n, rounds) catch std.math.nan(f64);
+    return smoke(n, rounds) catch {
+        // Its own failure: nothing later should read it.
+        var buf: [64]u8 = undefined;
+        _ = mlx.takeError(&buf);
+        return std.math.nan(f64);
+    };
 }
 
 fn smoke(n: i32, rounds: i32) !f64 {
@@ -90,7 +105,7 @@ fn smoke(n: i32, rounds: i32) !f64 {
 }
 
 /// This MLX's active, cache and peak bytes into `out[0..3]`. 0 on success.
-export fn pico_ms_memory(out: ?*[3]i64) i32 {
+pub export fn pico_ms_memory(out: ?*[3]i64) i32 {
     const o = out orelse return -1;
     ensureInit();
     var bytes: [3]usize = undefined;
