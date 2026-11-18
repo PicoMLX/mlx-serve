@@ -158,6 +158,17 @@ const Engine = struct {
         return null;
     }
 
+    /// Cancels every request and waits until each has had its final callback and its slot is back with the scheduler,
+    /// or was refused; then takes no more, and lets the reaper end.
+    fn drain(e: *Engine) void {
+        e.mu.lockUncancelable(e.io);
+        defer e.mu.unlock(e.io);
+        for (e.live.items) |r| cancelLocked(r);
+        while (e.live.items.len > 0 or e.done.items.len > 0 or e.reaping > 0) e.cond.waitUncancelable(e.io, &e.mu);
+        e.stop = true;
+        e.cond.broadcast(e.io);
+    }
+
     fn newRequest(e: *Engine, id: u64, cb: EventCb, ctx: ?*anyopaque) !*Request {
         const r = try e.alloc.create(Request);
         r.* = .{ .engine = e, .id = id, .cb = cb, .ctx = ctx, .submitter = std.Thread.getCurrentId() };
@@ -173,13 +184,15 @@ const Engine = struct {
         return true;
     }
 
-    /// A submission refused after `track`: no event of `r` was passed on and none follows.
+    /// A submission refused after `track`: no event of `r` was passed on and none follows. Wakes a close waiting for
+    /// the live set to empty.
     fn untrack(e: *Engine, r: *Request) void {
         e.mu.lockUncancelable(e.io);
         for (e.live.items, 0..) |x, i| if (x == r) {
             _ = e.live.swapRemove(i);
             break;
         };
+        e.cond.broadcast(e.io);
         e.mu.unlock(e.io);
         e.alloc.destroy(r);
     }
@@ -565,16 +578,7 @@ export fn pico_ms_close(h: ?*anyopaque) void {
 }
 
 fn closeHandle(e: *Engine) void {
-    const io = e.io;
-    {
-        e.mu.lockUncancelable(io);
-        defer e.mu.unlock(io);
-        for (e.live.items) |r| cancelLocked(r);
-        // Every request has had its final callback and its slot is back with the scheduler.
-        while (e.live.items.len > 0 or e.done.items.len > 0 or e.reaping > 0) e.cond.waitUncancelable(io, &e.mu);
-        e.stop = true;
-        e.cond.broadcast(io);
-    }
+    e.drain();
     if (e.reaper) |t| t.join();
 
     open_mutex.lock();
@@ -792,6 +796,35 @@ test "pico_ms: a request that finishes before its submitter publishes is never t
     try finishBeforePublish(fba.allocator());
     // And each request is freed exactly once (the test allocator reports a leak or a double free).
     try finishBeforePublish(testing.allocator);
+}
+
+test "pico_ms: a submission refused while close waits does not leave close waiting" {
+    var e = ledgerEngine(gpa);
+    defer e.live.deinit(gpa);
+    // Tracked, then refused by admission or the scheduler while close is already waiting for it.
+    const r = try e.newRequest(1, ignoreEvent, null);
+    try testing.expect(e.track(r));
+    var drained: std.atomic.Value(bool) = .init(false);
+    const Close = struct {
+        fn run(eng: *Engine, flag: *std.atomic.Value(bool)) void {
+            eng.drain();
+            flag.store(true, .release);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Close.run, .{ &e, &drained });
+    std.Io.sleep(theIo(), .fromMilliseconds(200), .awake) catch {};
+    try testing.expect(!drained.load(.acquire));
+    e.untrack(r);
+    var waited_ms: u32 = 0;
+    while (!drained.load(.acquire)) : (waited_ms += 10) {
+        if (waited_ms >= 5_000) {
+            t.detach();
+            return error.Deadlocked;
+        }
+        std.Io.sleep(theIo(), .fromMilliseconds(10), .awake) catch {};
+    }
+    t.join();
+    try testing.expect(e.stop);
 }
 
 test "pico_ms: a live id is refused, and a closing engine takes no request" {
