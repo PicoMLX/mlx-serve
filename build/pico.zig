@@ -30,6 +30,10 @@ const archives = [_][]const u8{ "libmlxc.a", "libmlx.a", "libjaccl.a", "libggufl
 
 const frameworks = [_][]const u8{ "Metal", "Foundation", "QuartzCore", "Accelerate", "IOKit" };
 
+/// The license texts and attributions that travel with the library (`NOTICE` lists the code they cover), installed
+/// beside it.
+const notices = [_][]const u8{ "LICENSE", "LICENSE-APACHE-2.0", "NOTICE" };
+
 /// C entry points of what the library leaves out, each answering "unavailable".
 const stubs = [_][]const u8{ "src/pico_stubs.c", "src/ane_stub.c" };
 
@@ -110,9 +114,11 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     const step = b.step("pico-lib", "Build libPicoMlxServe.dylib: a C interface over a private, statically linked MLX");
     step.dependOn(&b.addInstallFileWithDir(dylib, .lib, "libPicoMlxServe.dylib").step);
     step.dependOn(&b.addInstallFileWithDir(b.path(stage ++ "/mlx.metallib"), .lib, "mlx.metallib").step);
+    for (notices) |f| step.dependOn(&b.addInstallFileWithDir(b.path(f), .lib, f).step);
 
     // `pico-test`: the engine's tests (`src/pico_engine.zig`), linked as the library is and run beside mlx.metallib
-    // (`PICO_MS_TEST_MODEL=<dir>` adds the ones that need a model).
+    // (`PICO_MS_TEST_MODEL=<dir>` adds the ones that need a model), then what `pico-lib` installed beside the library
+    // compared with the build root's notices.
     const tests = b.addTest(.{
         .name = "pico-ms-test",
         .root_module = mod,
@@ -143,8 +149,16 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     const run = b.addSystemCommand(&.{"/usr/bin/env"});
     run.addFileArg(test_exe);
     run.has_side_effects = true;
-    const test_step = b.step("pico-test", "Run libPicoMlxServe's engine tests");
+    const test_step = b.step("pico-test", "Run libPicoMlxServe's engine tests, and check what pico-lib installs");
     test_step.dependOn(&run.step);
+    for (notices) |f| {
+        const same = b.addSystemCommand(&.{"cmp"});
+        same.addFileArg(b.path(f));
+        same.addFileArg(.{ .relative = .{ .base = .install_lib, .sub_path = f } });
+        same.step.dependOn(step);
+        same.has_side_effects = true;
+        test_step.dependOn(&same.step);
+    }
 }
 
 /// What the library links beside its own object: the "unavailable" stubs, the expert stream's C side
