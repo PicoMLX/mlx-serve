@@ -57,6 +57,12 @@ export fn pico_ms_abi_version() i32 {
     return 2;
 }
 
+/// Source build information as static UTF-8 JSON, or null for an unstamped build.
+export fn pico_ms_build_info_v1() ?[*:0]const u8 {
+    const json = @import("pico_build_info").json;
+    return if (json.len == 0) null else json;
+}
+
 /// The version of the MLX inside this library; static storage.
 export fn pico_ms_mlx_version() [*:0]const u8 {
     ensureInit();

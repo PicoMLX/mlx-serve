@@ -19,10 +19,10 @@ const stage = "lib/mlx-static/lib";
 
 /// The library's whole C interface.
 const exports = [_][]const u8{
-    "pico_ms_abi_version",  "pico_ms_mlx_version", "pico_ms_smoke",  "pico_ms_memory",
-    "pico_ms_can_serve",    "pico_ms_load_bytes",  "pico_ms_open",   "pico_ms_close",
-    "pico_ms_tokenize",     "pico_ms_detokenize",  "pico_ms_submit", "pico_ms_cancel",
-    "pico_ms_model_memory", "pico_ms_trim",
+    "pico_ms_abi_version", "pico_ms_build_info_v1", "pico_ms_mlx_version", "pico_ms_smoke",
+    "pico_ms_memory",      "pico_ms_can_serve",     "pico_ms_load_bytes",  "pico_ms_open",
+    "pico_ms_close",       "pico_ms_tokenize",      "pico_ms_detokenize",  "pico_ms_submit",
+    "pico_ms_cancel",      "pico_ms_model_memory",  "pico_ms_trim",
 };
 
 /// mlx-c first: each archive resolves against the ones after it.
@@ -34,6 +34,23 @@ const frameworks = [_][]const u8{ "Metal", "Foundation", "QuartzCore", "Accelera
 const stubs = [_][]const u8{ "src/pico_stubs.c", "src/ane_stub.c" };
 
 const stream_csrc = "src/sdk/weights/streamed/csrc";
+
+fn buildInfoModule(b: *std.Build) *std.Build.Module {
+    const tool = b.addExecutable(.{ .name = "pico_build_info", .root_module = b.createModule(.{
+        .root_source_file = b.path("build/pico_build_info.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }) });
+    const stamp = b.addRunArtifact(tool);
+    stamp.setCwd(b.path("."));
+    // A Git tag, index, or untracked source change can change the stamp without changing the Zig build graph.
+    stamp.has_side_effects = true;
+    const files = b.addWriteFiles();
+    _ = files.addCopyFile(stamp.addOutputFileArg("build-info.json"), "build-info.json");
+    return b.createModule(.{
+        .root_source_file = files.add("pico_build_info.zig", "pub const json = @embedFile(\"build-info.json\");\n"),
+    });
+}
 
 /// `src` compiled by Apple's clang, as the final link is, with hidden visibility: C++ here must share MLX's libc++.
 fn compile(b: *std.Build, min: std.SemanticVersion, flags: []const []const u8, src: []const u8) std.Build.LazyPath {
@@ -75,6 +92,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
         .link_libc = true,
         .imports = &.{
             .{ .name = "build_options", .module = options.createModule() },
+            .{ .name = "pico_build_info", .module = buildInfoModule(b) },
             .{ .name = "mlx_stamp", .module = config.mlxStampModule(b, "lib/mlx-static/.version") },
             .{ .name = "mlx_steel_sources", .module = embedded.mlx_steel_sources },
             .{ .name = "opencode2_plugin", .module = embedded.opencode2_plugin },
