@@ -31,6 +31,9 @@ zig-out/
 # Windows import libraries for the MSVC-built mlx-c (cross-compiled mlx-serve.exe)
 /lib/mlx-win/
 /lib/.mlx-build/
+# The static mlx + mlx-c `zig build pico-lib` links (scripts/build-mlx-static.sh)
+/lib/mlx-static/
+/lib/.mlx-static-build/
 # Linux counterpart staging work dir (scripts/build-mlx-linux.sh)
 /.work-mlx-linux/
 /.work-mlx-linux-cuda/
