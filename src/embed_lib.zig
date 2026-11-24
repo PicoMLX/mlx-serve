@@ -67,6 +67,11 @@ pub export fn pico_ms_abi_version() i32 {
     return 2;
 }
 
+/// Static UTF-8 JSON, or null when the library was built without source metadata.
+export fn pico_ms_build_info_v1() ?[*:0]const u8 {
+    return if (comptime @import("pico_build_info").json) |json| std.fmt.comptimePrint("{s}", .{json}) else null;
+}
+
 /// The version of the MLX inside this library; static storage.
 export fn pico_ms_mlx_version() [*:0]const u8 {
     ensureInit();

@@ -39,6 +39,7 @@ pub fn build(b: *std.Build) void {
         } else .{},
     });
     const optimize = b.standardOptimizeOption(.{});
+    @import("build/pico_build_info.zig").tests(b);
 
     // `pico-lib`: libPicoMlxServe.dylib, a library with its own private MLX and the MLX engine over it. It links
     // lib/mlx-static and none of the server's stages, so `-Dpico-only` stops once the plugins are registered: a tree

@@ -1,0 +1,67 @@
+name: Pico native library
+
+on:
+  push:
+    branches: [engine-router]
+  pull_request:
+    branches: [engine-router]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pico-lib-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-library:
+    runs-on: xcode-27
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install pinned Zig
+        run: |
+          bash scripts/fetch-zig.sh
+          echo "$GITHUB_WORKSPACE/.zig-toolchain" >> "$GITHUB_PATH"
+      - name: Source metadata host tests
+        run: zig build pico-build-info-test -Dpico-only -Doptimize=ReleaseFast
+      - name: Initialize MLX sources
+        run: git submodule update --init lib/mlx-src lib/mlxc-src
+      - name: Metal toolchain
+        run: xcrun -sdk macosx metal --version || sudo xcodebuild -downloadComponent MetalToolchain
+      - name: Build private static MLX
+        run: bash scripts/build-mlx-static.sh
+      - name: Build library and run C API tests
+        run: zig build pico-lib pico-test -Dpico-only -Doptimize=ReleaseFast --summary all
+      - name: Verify exported ABI, metadata and private MLX
+        run: |
+          python3 - <<'PY'
+          import ctypes
+          import json
+          import subprocess
+
+          def git(*args):
+              result = subprocess.run(["git", *args], capture_output=True, text=True, check=False)
+              return result.stdout.strip() if result.returncode == 0 else None
+
+          path = "zig-out/lib/libPicoMlxServe.dylib"
+          library = ctypes.CDLL(path)
+          library.pico_ms_abi_version.restype = ctypes.c_int32
+          assert library.pico_ms_abi_version() == 2
+          library.pico_ms_build_info_v1.restype = ctypes.c_char_p
+          info = json.loads(library.pico_ms_build_info_v1())
+          assert info == {
+              "revision": git("rev-parse", "--verify", "HEAD"),
+              "tag": git("describe", "--tags", "--exact-match", "HEAD"),
+              "dirty": bool(git("status", "--porcelain", "--untracked-files=all")),
+          }, info
+          symbols = subprocess.check_output(["nm", "-gU", path], text=True).splitlines()
+          assert symbols and all(line.split()[-1].startswith("_pico_ms_") for line in symbols), symbols
+          links = subprocess.check_output(["otool", "-L", path], text=True).lower()
+          assert "libmlx." not in links and "libmlxc." not in links, links
+          print(json.dumps(info, sort_keys=True))
+          PY
