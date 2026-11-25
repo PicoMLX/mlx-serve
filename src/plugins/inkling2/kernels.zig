@@ -83,6 +83,17 @@ fn launch(g: *Graph, k: *Kernel, inputs: []const Array, comptime n: usize, outs:
 }
 
 fn launchGrid(g: *Graph, k: *Kernel, inputs: []const Array, comptime n: usize, outs: [n]Out, grid: [3]c_int, tg: [3]c_int, targs: TArgs) ![n]Array {
+    if (comptime @import("builtin").is_test) {
+        if (stream_pipeline_cap_for_test) |probe| {
+            if (k == &pre_kernel or k == &mid_kernel) {
+                const threads = @as(i64, tg[0]) * tg[1] * tg[2];
+                if (threads > probe.limit) {
+                    probe.refused += 1;
+                    return error.ThreadLimit;
+                }
+            }
+        }
+    }
     const kernel = k.built orelse blk: {
         const iv = mlx.mlx_vector_string_new_data(k.ins.ptr, k.ins.len);
         defer _ = mlx.mlx_vector_string_free(iv);
@@ -132,6 +143,18 @@ fn floating(dt: Dtype) bool {
 /// The most threads a stream kernel's threadgroup takes. An M1 or M2 compiles a pipeline for what its registers
 /// allow, under 768 for some instantiations: a launch one refuses lowers this for the process (`narrow`).
 var stream_threads: u32 = 768;
+
+pub const StreamPipelineCapForTest = struct { limit: u32, refused: usize = 0 };
+var stream_pipeline_cap_for_test: ?*StreamPipelineCapForTest = null;
+
+/// Tests refuse wide stream launches before MLX work, exercising the production wrapper's narrowing path.
+pub fn exchangeStreamPipelineCapForTest(probe: ?*StreamPipelineCapForTest) ?*StreamPipelineCapForTest {
+    if (!@import("builtin").is_test) @compileError("the stream pipeline cap hook is test-only");
+    if (probe) |p| std.debug.assert(p.limit >= 32 and p.limit % 32 == 0);
+    const previous = stream_pipeline_cap_for_test;
+    stream_pipeline_cap_for_test = probe;
+    return previous;
+}
 
 /// Tests scope the real stream limit to exercise a reachable fallback, restoring the returned limit with defer.
 pub fn exchangeStreamThreadsForTest(limit: u32) u32 {

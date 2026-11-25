@@ -29,6 +29,8 @@ pub fn Pre(comptime dt: mlx.mlx_dtype, comptime msg: bool, comptime queries: usi
         launch: *const metal.Launch = &pre_launch,
         data: m.Data,
         shape: Shape = undefined,
+        adaptive_probed: bool = false,
+        last_run_threads: u32 = 0,
         pub fn init(a: std.mem.Allocator) Self {
             return .{ .rig = .init(a), .data = .init(a) };
         }
@@ -63,6 +65,8 @@ pub fn Pre(comptime dt: mlx.mlx_dtype, comptime msg: bool, comptime queries: usi
         pub fn prepare(s: *Self, sh: Shape, fill: spec.Fill, seed: u64) !bool {
             if (s.geometry(sh) == null) return false;
             s.shape = sh;
+            s.adaptive_probed = false;
+            s.last_run_threads = 0;
             s.data.reset(&s.rig);
             var p = std.Random.DefaultPrng.init(seed);
             const rng = p.random();
@@ -96,7 +100,12 @@ pub fn Pre(comptime dt: mlx.mlx_dtype, comptime msg: bool, comptime queries: usi
             return true;
         }
         pub fn run(s: *Self) !void {
-            try s.rig.launch(s.launch, s.geometry(s.shape).?, s.data.args[0..10]);
+            // The production wrapper probes each instantiation and may narrow the shared stream group.
+            // Recompute geometry only after that probe, including when a numerical gate calls run directly.
+            if (s.launch.adapts and !s.adaptive_probed) _ = try s.wrapper();
+            const g = s.geometry(s.shape).?;
+            s.last_run_threads = g.threads();
+            try s.rig.launch(s.launch, g, s.data.args[0..10]);
         }
         pub fn count(s: *const Self) usize {
             return (if (msg) 14 else J + 1) * s.shape.rows * s.shape.k;
@@ -191,7 +200,9 @@ pub fn Pre(comptime dt: mlx.mlx_dtype, comptime msg: bool, comptime queries: usi
             cfg.rms_norm_eps = 1e-6;
             const x = s.data.args;
             const o = try kernels.streams(&g, &cfg, x[0], if (s.shape.n > 0) x[1] else null, if (queries > 0) x[2] else .{ .ctx = null }, .{ x[3], x[4], x[5] }, J, if (msg) .{ .bank = x[6], .partial = x[7], .query = x[8], .gt = dt } else null);
-            return s.rig.bytesOf(if (msg) &.{ o[1], o[2], o[3], o[4] } else &.{ o[0], o[1] });
+            const bytes = try s.rig.bytesOf(if (msg) &.{ o[1], o[2], o[3], o[4] } else &.{ o[0], o[1] });
+            s.adaptive_probed = true;
+            return bytes;
         }
     };
 }
@@ -214,6 +225,8 @@ pub fn Mid(comptime dt: mlx.mlx_dtype, comptime msg: bool, comptime boundary: bo
         launch: *const metal.Launch = &mid_launch,
         data: m.Data,
         shape: Shape = undefined,
+        adaptive_probed: bool = false,
+        last_run_threads: u32 = 0,
         pub fn init(a: std.mem.Allocator) Self {
             return .{ .rig = .init(a), .data = .init(a) };
         }
@@ -251,6 +264,8 @@ pub fn Mid(comptime dt: mlx.mlx_dtype, comptime msg: bool, comptime boundary: bo
         pub fn prepare(s: *Self, sh: Shape, fill: spec.Fill, seed: u64) !bool {
             if (s.geometry(sh) == null) return false;
             s.shape = sh;
+            s.adaptive_probed = false;
+            s.last_run_threads = 0;
             s.data.reset(&s.rig);
             var p = std.Random.DefaultPrng.init(seed);
             const rng = p.random();
@@ -285,7 +300,12 @@ pub fn Mid(comptime dt: mlx.mlx_dtype, comptime msg: bool, comptime boundary: bo
             return true;
         }
         pub fn run(s: *Self) !void {
-            try s.rig.launch(s.launch, s.geometry(s.shape).?, s.data.args[0..10]);
+            // The production wrapper probes each instantiation and may narrow the shared stream group.
+            // Recompute geometry only after that probe, including when a numerical gate calls run directly.
+            if (s.launch.adapts and !s.adaptive_probed) _ = try s.wrapper();
+            const g = s.geometry(s.shape).?;
+            s.last_run_threads = g.threads();
+            try s.rig.launch(s.launch, g, s.data.args[0..10]);
         }
         pub fn count(s: *const Self) usize {
             return (if (msg) 4 else 3) * s.shape.rows * s.shape.k;
@@ -379,7 +399,9 @@ pub fn Mid(comptime dt: mlx.mlx_dtype, comptime msg: bool, comptime boundary: bo
             l.post_norm = x[7];
             l.boundary = boundary;
             const o = try kernels.middleStreams(&g, &l, &cfg, x[0], dt, x[3], x[4], if (s.shape.n > 0) x[5] else null, x[1], x[8], dt, msg);
-            return s.rig.bytesOf(if (msg) &.{ o[0], o[3], o[4] } else &.{ o[0], o[1], o[2] });
+            const bytes = try s.rig.bytesOf(if (msg) &.{ o[0], o[3], o[4] } else &.{ o[0], o[1], o[2] });
+            s.adaptive_probed = true;
+            return bytes;
         }
     };
 }

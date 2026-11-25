@@ -11,12 +11,12 @@ const experts = @import("contract_experts.zig");
 const kernels = @import("kernels.zig");
 const spec = m.spec;
 
-const Mode = enum { normal, fallback, offline };
+const Mode = enum { normal, fallback, offline, adaptive_drift };
 
 fn add(comptime mode: Mode, comptime drift: bool, set: *m.kc.Set, comptime T: type, comptime s: spec.Spec) !void {
     const adaptive = @hasDecl(T, "initFallback");
-    if (mode == .fallback and !adaptive) return;
-    const use_fallback = mode != .normal and adaptive;
+    if ((mode == .fallback or mode == .adaptive_drift) and !adaptive) return;
+    const use_fallback = (mode == .fallback or mode == .offline) and adaptive;
     const stated = comptime blk: {
         var copy = s;
         if (use_fallback) copy.name = s.name ++ " fallback32";
@@ -28,10 +28,11 @@ fn add(comptime mode: Mode, comptime drift: bool, set: *m.kc.Set, comptime T: ty
         const p: *T = @ptrCast(@alignCast(k.ctx));
         for (s.served) |shape| {
             try std.testing.expect(try p.prepare(shape, .random, 7));
+            // The served wrapper probes the pipeline first; the raw contract then refreshes its geometry.
+            const actual = try set.a.dupe(u8, try p.wrapper());
+            defer set.a.free(actual);
             try p.run();
-            const ours = try set.a.dupe(u8, p.rig.outputBytes());
-            defer set.a.free(ours);
-            const actual = try p.wrapper();
+            const ours = p.rig.outputBytes();
             if (!std.mem.eql(u8, ours, actual)) std.debug.print("launch drift: {s} {d}x{d}x{d}\n", .{ s.name, shape.rows, shape.n, shape.k });
             try std.testing.expectEqualSlices(u8, ours, actual);
         }
@@ -204,4 +205,62 @@ test "kernel contract inkling2 offline: fixed launches and stream fallbacks have
     defer _ = kernels.exchangeStreamThreadsForTest(prior);
     try registrations(.offline, false, &set);
     try @import("../../sdk/testing/kernel_contract/offline.zig").auditStrict(std.testing.allocator, std.testing.io, &set, std.mem.span(dir));
+}
+
+fn expectAdaptiveProbeBeforeRaw(comptime T: type) !void {
+    const a = std.testing.allocator;
+    var p = T.init(a);
+    defer p.deinit();
+    // Reusing the adapter also proves prepare clears its prior per-instantiation probe.
+    for ([_]spec.Shape{ .{ .rows = 8, .n = 2, .k = 2304 }, .{ .rows = 33, .n = 4, .k = 2304 } }) |shape| {
+        const prior_threads = kernels.exchangeStreamThreadsForTest(768);
+        defer _ = kernels.exchangeStreamThreadsForTest(prior_threads);
+        // Populate the real production probe cache before imposing the smaller simulated device limit.
+        try std.testing.expect(try p.prepare(shape, .random, 0xc0de));
+        _ = try p.wrapper();
+        _ = kernels.exchangeStreamThreadsForTest(768);
+        var cap: kernels.StreamPipelineCapForTest = .{ .limit = 256 };
+        const prior_cap = kernels.exchangeStreamPipelineCapForTest(&cap);
+        defer _ = kernels.exchangeStreamPipelineCapForTest(prior_cap);
+        try std.testing.expect(try p.prepare(shape, .random, 0xc0de));
+        try std.testing.expectEqual(@as(u32, 768), p.geometry(shape).?.threads());
+        const before = try a.dupe(u8, try p.rig.inputBytes());
+        defer a.free(before);
+        // Call run without the drift helper: the numerical gates begin with this same fresh-adapter path.
+        try p.run();
+        try std.testing.expect(cap.refused > 0);
+        try std.testing.expect(p.last_run_threads <= cap.limit);
+        try std.testing.expectEqual(p.geometry(shape).?.threads(), p.last_run_threads);
+        const ours = try a.dupe(u8, p.rig.outputBytes());
+        defer a.free(ours);
+        try std.testing.expectEqualSlices(u8, ours, try p.wrapper());
+        try std.testing.expectEqualSlices(u8, before, try p.rig.inputBytes());
+        try std.testing.expect(try p.rig.intact());
+        try std.testing.expect(!m.mlx.errorPending());
+    }
+}
+
+test "kernel contract inkling2: adaptive streams probe before raw dispatch and refresh each prepared shape" {
+    if (m.mlx.noGpuBackend() or m.mlx.virtualGpu() or !m.mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    try expectAdaptiveProbeBeforeRaw(streams.Pre(.bfloat16, true, 3));
+    try expectAdaptiveProbeBeforeRaw(streams.Pre(.float32, false, 1));
+    try expectAdaptiveProbeBeforeRaw(streams.Mid(.bfloat16, true, true, true));
+    try expectAdaptiveProbeBeforeRaw(streams.Mid(.float32, false, false, false));
+
+    // Exercise the generic drift helper under the same refusal, with the original 24 adaptive registrations.
+    const prior_threads = kernels.exchangeStreamThreadsForTest(768);
+    defer _ = kernels.exchangeStreamThreadsForTest(prior_threads);
+    var cap: kernels.StreamPipelineCapForTest = .{ .limit = 256 };
+    const prior_cap = kernels.exchangeStreamPipelineCapForTest(&cap);
+    defer _ = kernels.exchangeStreamPipelineCapForTest(prior_cap);
+    var set = m.kc.Set.init(std.testing.allocator);
+    defer set.deinit();
+    try registrations(.adaptive_drift, true, &set);
+    try std.testing.expectEqual(@as(usize, 24), set.kernels.items.len);
+    try std.testing.expect(cap.refused > 0);
+    for (set.kernels.items) |k| {
+        try std.testing.expect(k.vt.launch.?(k.ctx).adapts);
+        for (k.spec.served) |shape| try std.testing.expect(k.vt.geometry.?(k.ctx, shape).?.threads() <= cap.limit);
+    }
+    try std.testing.expect(!m.mlx.errorPending());
 }
