@@ -2793,9 +2793,24 @@ pub fn register(set: *kc.Set) !void {
     try set.add(OProj, .init(set.a, 4, 32), oprojSpec("inkling2 oproj bf16 (4-bit g32)", 32, .{ .f16 = 40, .why = "stress codes under 16 in groups of 32: an fp16 sum misses by ~45x, short of 100x but far past fp32's exact sums" }), null);
     try set.add(OProj, .init(set.a, 4, 128), oprojSpec("inkling2 oproj bf16 (4-bit g128)", 128, .{}), null);
     try set.add(OProj, .init(set.a, 0, 16), oprojSpec("inkling2 oproj bf16 (dense)", 16, .{}), null);
+    try @import("contract_extended.zig").register(set);
 }
 
 // ── tests ──
+
+test "kernel contract inkling2: every served pipeline family is registered" {
+    var set = kc.Set.init(std.testing.allocator);
+    defer set.deinit();
+    try register(&set);
+    for ([_][]const u8{ "inkling2 pre ", "inkling2 prep ", "inkling2 mid ", "inkling2 ups ", "inkling2 downs ", "inkling2 relattn ", "inkling2 gate (prompt" }) |prefix| {
+        var found = false;
+        for (set.kernels.items) |k| if (std.mem.startsWith(u8, k.spec.name, prefix)) {
+            found = true;
+        };
+        if (!found) std.debug.print("missing served kernel contract: {s}\n", .{prefix});
+        try std.testing.expect(found);
+    }
+}
 
 test "kernel contract inkling2: each declared launch is the shipped wrapper's, byte for byte" {
     if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
@@ -2839,7 +2854,7 @@ test "kernel contract inkling2: each declared launch is the shipped wrapper's, b
             try std.testing.expectEqualSlices(u8, try p.wrapper(), ours);
         }
     }
-    for (set.kernels.items[at..]) |k| {
+    for (set.kernels.items[at .. at + 9]) |k| {
         const p: *OProj = @ptrCast(@alignCast(k.ctx));
         for (k.spec.served) |shape| {
             try std.testing.expect(try p.prepare(shape, .random, 7));

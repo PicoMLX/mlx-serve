@@ -133,6 +133,15 @@ fn floating(dt: Dtype) bool {
 /// allow, under 768 for some instantiations: a launch one refuses lowers this for the process (`narrow`).
 var stream_threads: u32 = 768;
 
+/// Tests scope the real stream limit to exercise a reachable fallback, restoring the returned limit with defer.
+pub fn exchangeStreamThreadsForTest(limit: u32) u32 {
+    if (!@import("builtin").is_test) @compileError("the stream thread limit hook is test-only");
+    std.debug.assert(limit >= 32 and limit % 32 == 0);
+    const previous = stream_threads;
+    stream_threads = limit;
+    return previous;
+}
+
 /// The threadgroup of a kernel that sums over the stream: SIMD groups of 32 that tile the width, as few groups as
 /// `stream_threads` allow (every group redoes the sums).
 pub fn streamGroup(hidden: u32) ?c_int {
@@ -187,7 +196,7 @@ pub fn runs(g: *const Graph, L: *const Layer, cfg: *const Config, h: Array) bool
 const Messaged = struct { bank: Array, partial: Array, query: Array, gt: Dtype };
 
 /// `pre.metal` on the stream `h` `[1, S, D]`: its outputs in order.
-fn streams(g: *Graph, cfg: *const Config, h: Array, blocks: ?Array, query: Array, nw: [3]Array, inputs: c_int, msg: ?Messaged) ![5]Array {
+pub fn streams(g: *Graph, cfg: *const Config, h: Array, blocks: ?Array, query: Array, nw: [3]Array, inputs: c_int, msg: ?Messaged) ![5]Array {
     const d: c_int = @intCast(cfg.hidden_size);
     const s = ops.shape(h)[1];
     const dt = ops.dtype(h);
@@ -217,8 +226,16 @@ fn streams(g: *Graph, cfg: *const Config, h: Array, blocks: ?Array, query: Array
 /// streams), from each gate's state `st` `[n, S, rank]`: `[n, S, D]` f32. A few rows' threads take the forget and
 /// message projections themselves (MLX's f32 matmul at two rows is several launches' latency); a prompt's rows take
 /// them from two matmuls.
+/// Pointwise arm after a prompt's projections (or a few-row visit's direct dots).
+pub fn gateMix(g: *Graph, a: Array, ms: Array, st: Array, forget: Array, message: Array, projected: bool) !Array {
+    const s = ops.shape(st)[1];
+    const o = try launch(g, &gate_kernel, &.{ a, ms, st, forget, message }, 1, .{.{ .shape = &.{ ops.shape(a)[0], s, ops.shape(a)[2] }, .dtype = .float32 }}, ops.shape(a)[0] * s * ops.shape(a)[2], 64, &.{
+        .{ "D", .{ .int = ops.shape(a)[2] } }, .{ "RANK", .{ .int = ops.shape(st)[2] } }, .{ "PROJ", .{ .int = @intFromBool(projected) } },
+    });
+    return o[0];
+}
+
 pub fn gate(g: *Graph, gates: *const layers.Gates, a: Array, ms: Array, st: Array, from: c_int, n: c_int) !Array {
-    const sh = ops.shape(gates.forget);
     const s = ops.shape(st)[1];
     var forget = try g.sliceAxis(gates.forget, 0, from, from + n);
     var message = try g.sliceAxis(gates.message, 0, from, from + n);
@@ -228,10 +245,7 @@ pub fn gate(g: *Graph, gates: *const layers.Gates, a: Array, ms: Array, st: Arra
         forget = try g.matmul(st32, try g.transpose(try g.astype(forget, .float32), &.{ 0, 2, 1 }));
         message = try g.matmul(st32, try g.transpose(try g.astype(message, .float32), &.{ 0, 2, 1 }));
     }
-    const o = try launch(g, &gate_kernel, &.{ a, ms, st, forget, message }, 1, .{.{ .shape = &.{ n, s, sh[1] }, .dtype = .float32 }}, n * s * sh[1], 64, &.{
-        .{ "D", .{ .int = sh[1] } }, .{ "RANK", .{ .int = sh[2] } }, .{ "PROJ", .{ .int = @intFromBool(projected) } },
-    });
-    return o[0];
+    return gateMix(g, a, ms, st, forget, message, projected);
 }
 
 /// The threads a stream kernel adds to a row for the router: a SIMD group per expert, in whole threadgroups.
@@ -371,8 +385,8 @@ pub fn oGated(g: *Graph, o: *const layers.Linear, att: Array, gate_sigmoid: Arra
     const n = ops.shape(o.w)[0];
     const affine = f.fmt == 3;
     const y = try launchGrid(g, &oproj_kernel, &.{ att, gate_sigmoid, o.w, if (affine) o.s else o.w, if (affine) o.b else o.w }, 1, .{.{ .shape = &.{ 1, 1, n }, .dtype = dt }}, .{ 32, n, 1 }, .{ 32, 4, 1 }, &.{
-        .{ "T", .{ .dtype = dt } },               .{ "S", .{ .dtype = if (affine) ops.dtype(o.s) else dt } }, .{ "K", .{ .int = f.k } },
-        .{ "GS", .{ .int = @intCast(f.gs) } },    .{ "BITS", .{ .int = @intCast(f.bits) } },                    .{ "FMT", .{ .int = f.fmt } },
+        .{ "T", .{ .dtype = dt } },            .{ "S", .{ .dtype = if (affine) ops.dtype(o.s) else dt } }, .{ "K", .{ .int = f.k } },
+        .{ "GS", .{ .int = @intCast(f.gs) } }, .{ "BITS", .{ .int = @intCast(f.bits) } },                  .{ "FMT", .{ .int = f.fmt } },
     });
     return y[0];
 }
@@ -404,11 +418,29 @@ pub const small_rows = 32;
 /// S keys) under the bias of their clipped relative `states` `[1, S, H, d_rel]` and their `sinks` `[1, S, H]`:
 /// `[1, S, H, hd]`. `offset` is the first row's position. One flash launch with no mask built, or (at most
 /// `small_rows` rows, unless `flash`) a mask launch and MLX's attention.
+/// Flash read on the prepared query/bias views, also used by the launch contract.
+pub fn flashRead(g: *Graph, q: Array, k: Array, v: Array, bias: Array, sinks: Array, key_start: Array, window: c_int) !Array {
+    const dt = ops.dtype(q);
+    const hd = ops.shape(q)[3];
+    const heads = ops.shape(q)[1];
+    const s = ops.shape(q)[2];
+    const keys = ops.shape(k)[2];
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    const o = try launchGrid(g, &relattn_kernel, &.{
+        q, k, v, bias, sinks, key_start, try g.fromSlice(i32, &.{ s, keys }, &.{2}), try g.scalar(scale, .float32),
+    }, 1, .{.{ .shape = &.{ 1, s, heads, hd }, .dtype = dt }}, .{ @divTrunc(s + 31, 32) * 128, heads, 1 }, .{ 128, 1, 1 }, &.{
+        .{ "T", .{ .dtype = dt } },               .{ "D", .{ .int = hd } },
+        .{ "HQ", .{ .int = heads } },             .{ "HKV", .{ .int = ops.shape(k)[1] } },
+        .{ "R", .{ .int = ops.shape(bias)[3] } }, .{ "WINDOW", .{ .int = window } },
+        .{ "BQ", .{ .int = 32 } },                .{ "TG", .{ .int = 128 } },
+    });
+    return o[0];
+}
+
 pub fn relative(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array, rel_states: Array, sinks: Array, k: Array, v: Array, offset: c_int, flash: bool) !Array {
     const dt = ops.dtype(q_rows);
     const hd: c_int = @intCast(cfg.head_dim);
     if (ops.dtype(k) != dt or ops.dtype(v) != dt or @rem(hd, 8) != 0) return error.Inkling2StepDtype;
-    const heads: c_int = @intCast(cfg.num_attention_heads);
     const s = ops.shape(q_rows)[1];
     const keys = ops.shape(k)[2];
     const in = try readInputs(g, L, cfg, q_rows, rel_states, sinks, offset);
@@ -422,15 +454,7 @@ pub fn relative(g: *Graph, L: *const Layer, cfg: *const Config, q_rows: Array, r
         const read = try g.sdpa(q, try g.concat(&.{ k, zero }, 2), try g.concat(&.{ v, zero }, 2), scale, .{ .array = try relMask(g, bias, sink_rows, keys, window, true) });
         return g.transpose(read, &.{ 0, 2, 1, 3 });
     }
-    const o = try launchGrid(g, &relattn_kernel, &.{
-        q, k, v, bias, sink_rows, try g.zeros(&.{1}, .int32), try g.fromSlice(i32, &.{ s, keys }, &.{2}), try g.scalar(scale, .float32),
-    }, 1, .{.{ .shape = &.{ 1, s, heads, hd }, .dtype = dt }}, .{ @divTrunc(s + 31, 32) * 128, heads, 1 }, .{ 128, 1, 1 }, &.{
-        .{ "T", .{ .dtype = dt } },                     .{ "D", .{ .int = hd } },
-        .{ "HQ", .{ .int = heads } },                   .{ "HKV", .{ .int = @intCast(cfg.num_key_value_heads) } },
-        .{ "R", .{ .int = ops.shape(L.rel_proj)[1] } }, .{ "WINDOW", .{ .int = window } },
-        .{ "BQ", .{ .int = 32 } },                      .{ "TG", .{ .int = 128 } },
-    });
-    return o[0];
+    return flashRead(g, q, k, v, bias, sink_rows, try g.zeros(&.{1}, .int32), window);
 }
 
 /// The fold kernel's threads a threadgroup and vocab columns a thread.
@@ -778,9 +802,9 @@ pub fn slotParts(g: *Graph, q: Array, ks: []const Array, vs: []const Array, bias
         .{ .shape = &.{ splits, ng * heads, hd }, .dtype = .float32 },
         .{ .shape = &.{ splits, ng * heads, 2 }, .dtype = .float32 },
     }, .{ splits * 32 * slot_groups, ops.shape(ks[0])[1], ng }, .{ 32 * slot_groups, 1, 1 }, &.{
-        .{ "T", .{ .dtype = ops.dtype(q) } }, .{ "D", .{ .int = hd } },                    .{ "HQ", .{ .int = heads } },
+        .{ "T", .{ .dtype = ops.dtype(q) } },        .{ "D", .{ .int = hd } },                 .{ "HQ", .{ .int = heads } },
         .{ "HKV", .{ .int = ops.shape(ks[0])[1] } }, .{ "R", .{ .int = ops.shape(bias)[3] } }, .{ "NS", .{ .int = ng } },
-        .{ "NSG", .{ .int = slot_groups } },  .{ "KB", .{ .int = slot_keys } },            .{ "WINDOW", .{ .int = window } },
+        .{ "NSG", .{ .int = slot_groups } },         .{ "KB", .{ .int = slot_keys } },         .{ "WINDOW", .{ .int = window } },
     });
 }
 
@@ -792,21 +816,13 @@ pub const Middle = struct { x: Array, idx: Array, weights: Array, residual: Arra
 /// `layers.mid`: `attn` are the gated attention rows, `h` the visit's input stream, `normed` its unweighted norm,
 /// `messages` `[4, S, D]` on a later loop pass.
 /// `out_gate`: the output gate of a read `attend` left ungated (one row), applied inside the output projection.
-pub fn mid(g: *Graph, L: *const Layer, w: *const Body, attn: Array, out_gate: ?Array, h: Array, normed: Array, blocks: ?Array, st: Array, messages: ?Array) !Middle {
-    const cfg = &w.cfg;
+/// The middle stream kernel before the loop message gate/router; shared by the visit and its launch contract.
+pub fn middleStreams(g: *Graph, L: *const Layer, cfg: *const Config, op: Array, dt: Dtype, h: Array, normed: Array, blocks: ?Array, st: Array, msg3: Array, gt: Dtype, on: bool) ![5]Array {
     const d: c_int = @intCast(cfg.hidden_size);
     const s = ops.shape(h)[1];
     const kt: c_int = @intCast(cfg.sconv_kernel);
-    const top_k: c_int = @intCast(cfg.top_k);
-    const op = if (out_gate) |gt| try oGated(g, &L.o, attn, gt) else try layers.projectRows(g, &L.o, attn);
-    const dt = ops.dtype(attn);
-    if (!floating(ops.dtype(op))) return error.Inkling2StepDtype;
-    const gates: ?*const layers.Gates = if (messages != null) &(L.gates orelse return error.Inkling2NoMessageGate) else null;
-    const gt: Dtype = if (gates) |x| ops.dtype(x.down) else .float32;
-    const msg3: Array = if (messages) |m| try g.sliceAxis(m, 0, 3, 4) else h;
     const pr = try g.fromSlice(f32, &.{ 1.0 / @sqrt(@as(f32, @floatFromInt(kt + 1))), cfg.rms_norm_eps }, &.{2});
-    const on = gates != null;
-    const o = while (true) {
+    return while (true) {
         const tg = streamGroup(cfg.hidden_size) orelse return error.ThreadLimit;
         break launchGrid(g, &mid_kernel, &.{ op, st, L.attn_conv, h, normed, blocks orelse h, L.mlp_query, L.post_norm, msg3, pr }, 5, .{
             .{ .shape = &.{ 1, s, d }, .dtype = .float32 },
@@ -823,6 +839,19 @@ pub fn mid(g: *Graph, L: *const Layer, w: *const Body, attn: Array, out_gate: ?A
             .{ "MSG", .{ .int = @intFromBool(on) } },                      .{ "SEQ", seqOf(st) },
         }) catch |e| if (e == error.ThreadLimit and narrow(cfg.hidden_size)) continue else return e;
     };
+}
+
+pub fn mid(g: *Graph, L: *const Layer, w: *const Body, attn: Array, out_gate: ?Array, h: Array, normed: Array, blocks: ?Array, st: Array, messages: ?Array) !Middle {
+    const cfg = &w.cfg;
+    const s = ops.shape(h)[1];
+    const top_k: c_int = @intCast(cfg.top_k);
+    const op = if (out_gate) |gt| try oGated(g, &L.o, attn, gt) else try layers.projectRows(g, &L.o, attn);
+    const dt = ops.dtype(attn);
+    if (!floating(ops.dtype(op))) return error.Inkling2StepDtype;
+    const gates: ?*const layers.Gates = if (messages != null) &(L.gates orelse return error.Inkling2NoMessageGate) else null;
+    const gt: Dtype = if (gates) |x| ops.dtype(x.down) else .float32;
+    const msg3: Array = if (messages) |m| try g.sliceAxis(m, 0, 3, 4) else h;
+    const o = try middleStreams(g, L, cfg, op, dt, h, normed, blocks, st, msg3, gt, gates != null);
     var x = o[1];
     // A plain visit's router is MLX's matmul; a looped one's rides its norm kernel, where the rows read the stream
     // as it is (inside `mid.metal` each row would redo the conv and the mix: slower than the launch it saves).
@@ -903,8 +932,39 @@ fn biasesOf(bank: anytype) Array {
 /// One row, a packed bank read in place: the picks' gate_up and the soft-capped SwiGLU as one launch, their down, the
 /// weighted sum, the MLP's conv behind `st` and the final add as a second. Another bank, or more rows (their pairs
 /// sorted by expert), go through MLX's gather, with the SwiGLU and the sum, conv and add as launches of their own.
+/// Packed gate/up launch, shared by the visit and the independent kernel contract.
+pub fn packedUp(g: *Graph, bank: anytype, x: Array, sel: Array, scale: Array, caps: Array, top_k: c_int, fmt: c_int, scaled: bool) !Array {
+    const dt = ops.dtype(x);
+    const hidden = ops.shape(x)[2];
+    const inter = @divExact(ops.shape(bank.w)[1], 2);
+    const n = ops.shape(x)[1] * top_k;
+    const o = try launchGrid(g, &ups_kernel, &.{ x, bank.w, bank.s, biasesOf(bank), sel, scale, caps }, 1, .{.{ .shape = &.{ n, 1, inter }, .dtype = dt }}, .{ 32, @divExact(inter, bank_rows), n }, .{ 32, bank_groups, 1 }, &.{
+        .{ "T", .{ .dtype = dt } },                          .{ "K", .{ .int = hidden } },              .{ "I", .{ .int = inter } },
+        .{ "GS", .{ .int = @intCast(bank.qp.group_size) } }, .{ "FMT", .{ .int = fmt } },               .{ "ROWS", .{ .int = bank_rows } },
+        .{ "BITS", .{ .int = @intCast(bank.qp.bits) } },     .{ "S", .{ .dtype = ops.dtype(bank.s) } }, .{ "SCALED", .{ .int = @intFromBool(scaled) } },
+        .{ "KSEL", .{ .int = top_k } },
+    });
+    return o[0];
+}
+
+/// Packed down/reduce, with the one-row conv tail or a few rows' MLP outputs.
+pub fn packedDown(g: *Graph, bank: anytype, act: Array, sel: Array, scale: Array, weights: Array, residual: Array, st: Array, taps: Array, conv_scale: Array, top_k: c_int, fmt: c_int, scaled: bool, tail: bool) ![2]Array {
+    const dt = ops.dtype(act);
+    const s = ops.shape(residual)[1];
+    const hidden = ops.shape(residual)[2];
+    const inter = ops.shape(act)[2];
+    const kt = ops.shape(st)[1] + 1;
+    const out: Out = .{ .shape = &.{ 1, s, hidden }, .dtype = dt };
+    return try launchGrid(g, &downs_kernel, &.{ act, bank.w, bank.s, biasesOf(bank), sel, scale, weights, residual, st, taps, conv_scale }, 2, .{ if (tail) out else unused, out }, .{ 32, top_k, s * @divExact(hidden, bank_rows) }, .{ 32, top_k, 1 }, &.{
+        .{ "T", .{ .dtype = dt } },                      .{ "WT", .{ .dtype = ops.dtype(taps) } },            .{ "I", .{ .int = inter } },
+        .{ "D", .{ .int = hidden } },                    .{ "GS", .{ .int = @intCast(bank.qp.group_size) } }, .{ "FMT", .{ .int = fmt } },
+        .{ "ROWS", .{ .int = bank_rows } },              .{ "KSEL", .{ .int = top_k } },                      .{ "KT", .{ .int = kt } },
+        .{ "BITS", .{ .int = @intCast(bank.qp.bits) } }, .{ "S", .{ .dtype = ops.dtype(bank.s) } },           .{ "SCALED", .{ .int = @intFromBool(scaled) } },
+        .{ "TAIL", .{ .int = @intFromBool(tail) } },
+    });
+}
+
 pub fn experts(g: *Graph, L: *const Layer, cfg: *const Config, m: *const Middle, kp: Array, vp: Array, st: Array, open: ?*Open) !Tail {
-    const dt = ops.dtype(m.x);
     const s = ops.shape(m.x)[1];
     const top_k: c_int = @intCast(cfg.top_k);
     const inter: c_int = @intCast(cfg.moe_intermediate_size);
@@ -919,19 +979,10 @@ pub fn experts(g: *Graph, L: *const Layer, cfg: *const Config, m: *const Middle,
     const conv_scale = try g.fromSlice(f32, &.{1.0 / @sqrt(@as(f32, @floatFromInt(kt + 1)))}, &.{1});
     const gu_scale = if (L.gate_up_scale.ctx != null) L.gate_up_scale else caps;
     const dn_scale = if (L.down_scale.ctx != null) L.down_scale else m.weights;
-    const gu_scaled: TArg = .{ .int = @intFromBool(L.gate_up_scale.ctx != null) };
-    const dn_scaled: TArg = .{ .int = @intFromBool(L.down_scale.ctx != null) };
-    const act_out: [1]Out = .{.{ .shape = &.{ n, 1, inter }, .dtype = dt }};
-    const tail_out: [2]Out = .{ .{ .shape = &.{ 1, s, hidden }, .dtype = dt }, .{ .shape = &.{ 1, s, hidden }, .dtype = dt } };
     const sorted = pairs.inverse != null;
 
     const act = if (if (s == 1 or few) packedFormat(&L.gate_up, hidden) else null) |fmt|
-        try launchGrid(g, &ups_kernel, &.{ m.x, L.gate_up.w, L.gate_up.s, biasesOf(&L.gate_up), sel, gu_scale, caps }, 1, act_out, .{ 32, @divExact(inter, bank_rows), n }, .{ 32, bank_groups, 1 }, &.{
-            .{ "T", .{ .dtype = dt } },                               .{ "K", .{ .int = hidden } }, .{ "I", .{ .int = inter } },
-            .{ "GS", .{ .int = @intCast(L.gate_up.qp.group_size) } }, .{ "FMT", .{ .int = fmt } },  .{ "ROWS", .{ .int = bank_rows } },
-            .{ "BITS", .{ .int = @intCast(L.gate_up.qp.bits) } },     .{ "S", .{ .dtype = ops.dtype(L.gate_up.s) } },
-            .{ "SCALED", gu_scaled },                                 .{ "KSEL", .{ .int = top_k } },
-        })
+        .{try packedUp(g, &L.gate_up, m.x, sel, gu_scale, caps, top_k, fmt, L.gate_up_scale.ctx != null)}
     else blk: {
         const gu = try layers.gather(g, pairs.rows, &L.gate_up, sel, sorted);
         if (!floating(ops.dtype(gu))) return error.Inkling2StepDtype;
@@ -940,13 +991,7 @@ pub fn experts(g: *Graph, L: *const Layer, cfg: *const Config, m: *const Middle,
 
     // The down kernel's threadgroup holds every pick of its rows.
     const o = if (if ((s == 1 and 32 * top_k <= sure_threads) or few) packedFormat(&L.down, inter) else null) |fmt| blk: {
-        const packed_out = try launchGrid(g, &downs_kernel, &.{ act[0], L.down.w, L.down.s, biasesOf(&L.down), sel, dn_scale, m.weights, m.residual, st, L.mlp_conv, conv_scale }, 2, .{ if (few) unused else tail_out[0], tail_out[1] }, .{ 32, top_k, s * @divExact(hidden, bank_rows) }, .{ 32, top_k, 1 }, &.{
-            .{ "T", .{ .dtype = dt } },         .{ "WT", .{ .dtype = ops.dtype(L.mlp_conv) } },        .{ "I", .{ .int = inter } },
-            .{ "D", .{ .int = hidden } },       .{ "GS", .{ .int = @intCast(L.down.qp.group_size) } }, .{ "FMT", .{ .int = fmt } },
-            .{ "ROWS", .{ .int = bank_rows } }, .{ "KSEL", .{ .int = top_k } },                        .{ "KT", .{ .int = kt } },
-            .{ "BITS", .{ .int = @intCast(L.down.qp.bits) } }, .{ "S", .{ .dtype = ops.dtype(L.down.s) } },
-            .{ "SCALED", dn_scaled },           .{ "TAIL", .{ .int = @intFromBool(!few) } },
-        });
+        const packed_out = try packedDown(g, &L.down, act[0], sel, dn_scale, m.weights, m.residual, st, L.mlp_conv, conv_scale, top_k, fmt, L.down_scale.ctx != null, !few);
         if (!few) break :blk packed_out;
         // The rows' MLP outputs are whole: the conv over them and the add, as the wide sum over one pick a row.
         const rows_at = try g.arange(0, @floatFromInt(s), 1, .uint32);

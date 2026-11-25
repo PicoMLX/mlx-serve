@@ -98,5 +98,14 @@ load, the draft round and the fixture; `vision.zig` + `media.zig` the image towe
   (GPU), and each kernel against its chain.
 - `contract.zig`: `gated`, `state`, `relmask`, `act`, `sum`, `topk`, `gate` (its one-row arm), `relsplit`, `relcomb`,
   `relslots`, `markov_rnn`, `markov_fold`, `markov_pick`, `oproj`, `router`, `norm`.
-  Owed: `pre`, `prep`, `mid`, `ups`, `downs`, `relattn`, and `gate`'s prompt arm.
+  `contract_extended.zig` adds 70 variants for `pre`, `prep`, `mid`, `ups`, `downs`, `relattn`, and `gate`'s prompt arm:
+  bf16/f32 streams, message/sequence/slot arms, all affine widths at group 64 and 4-bit groups 32/128. Together these
+  form 102 normal variants. Separate tests add 24 reachable 32-thread `pre`/`mid` fallback variants through the real
+  launcher, preserving every normal numerical and wrapper drift case.
+  The 24 normal adaptive stream variants probe every production instantiation and assert no M1/M2 pipeline cap.
+  The scoped strict offline audit checks the 46 new fixed launches plus 24 explicit fallbacks; an inconclusive
+  compile fails it. Records assert conservative required-thread lower bounds, not exact pipeline maxima. This
+  audit does not claim that the 24 wide adaptive stream variants have compiler-derived caps.
+- Q/K/relative clipping must propagate a NaN norm to every lane, as `layers.l2Clip` does: preserve a NaN ratio before
+  Metal's `min(ratio,1)`, which otherwise suppresses that NaN.
 - Not verified: an image against mlx-lm's tower, the drafter's tokens against oMLX's.

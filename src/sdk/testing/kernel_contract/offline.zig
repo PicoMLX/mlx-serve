@@ -8,7 +8,7 @@ const env = @import("../../../env.zig");
 const builtin = @import("builtin");
 const mlx = @import("../../../mlx/ffi.zig");
 const spec = @import("spec.zig");
-const registry = @import("registry.zig");
+const Set = @import("set.zig").Set;
 
 /// The translator's M1 and M2 targets (phones left out); a family's limit is its lowest.
 const m1_archs = [_][]const u8{ "applegpu_g13g", "applegpu_g13s", "applegpu_g13d" };
@@ -98,17 +98,29 @@ fn native(x: Ctx, lib: []const u8, fun: []const u8, arch: []const u8, threads: u
     return section(bytes, inner_at, "__text");
 }
 
-/// The most threads (a multiple of 32) whose build equals the plain one: what the plain pipeline runs at.
-fn limitOn(x: Ctx, lib: []const u8, fun: []const u8, arch: []const u8) !u32 {
-    const plain = try native(x, lib, fun, arch, 0);
-    if (std.mem.eql(u8, plain, try native(x, lib, fun, arch, 1024))) return 1024;
-    var lo: u32 = 0;
-    var hi: u32 = 33;
-    while (lo + 1 < hi) {
-        const mid = (lo + hi) / 2;
-        if (std.mem.eql(u8, plain, try native(x, lib, fun, arch, 32 * mid))) lo = mid else hi = mid;
+/// A compiler's register allocation can change nonmonotonically with the requested thread count. Search every
+/// SIMD-group width from largest to smallest; binary search can discard real matching instruction streams.
+fn largestMatch(context: anytype, comptime matches: anytype) !u32 {
+    var threads: u32 = 1024;
+    while (threads >= 32) : (threads -= 32) {
+        if (try matches(context, threads)) return threads;
     }
-    return 32 * lo;
+    return 0;
+}
+
+/// A proven lower bound: the plain instruction stream also compiles for this many requested threads.
+fn limitOn(x: Ctx, lib: []const u8, fun: []const u8, arch: []const u8) !u32 {
+    const Match = struct {
+        x: Ctx,
+        lib: []const u8,
+        fun: []const u8,
+        arch: []const u8,
+        plain: []const u8,
+        fn at(m: @This(), threads: u32) !bool {
+            return std.mem.eql(u8, m.plain, try native(m.x, m.lib, m.fun, m.arch, threads));
+        }
+    };
+    return largestMatch(Match{ .x = x, .lib = lib, .fun = fun, .arch = arch, .plain = try native(x, lib, fun, arch, 0) }, Match.at);
 }
 
 fn familyLimit(x: Ctx, lib: []const u8, fun: []const u8, archs: []const []const u8) !u32 {
@@ -130,23 +142,31 @@ fn functionName(source: []const u8) ?[]const u8 {
     return source[at + key.len .. end];
 }
 
-// ── tests ──
+/// Audit one registration set with the same compiler rules as the global registry test.
+pub fn audit(allocator: std.mem.Allocator, io: std.Io, set: *const Set, directory: []const u8) !void {
+    try auditSet(allocator, io, set, directory, false);
+}
 
-test "kernel contract offline: each record's M1/M2 limit is what the toolchain compiles" {
-    const dir = env.get(.MLX_SERVE_KERNEL_CONTRACT_OFFLINE) orelse return error.SkipZigTest;
-    if (!builtin.os.tag.isDarwin() or mlx.noGpuBackend()) return error.SkipZigTest;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+/// A fixed-launch set must have positive compiler evidence at every accepted shape. Adaptive wrappers supply
+/// their explicitly forced fallback registrations, so this never treats an unknown wide pipeline as verified.
+pub fn auditStrict(allocator: std.mem.Allocator, io: std.Io, set: *const Set, directory: []const u8) !void {
+    try auditSet(allocator, io, set, directory, true);
+}
+
+fn auditSet(allocator: std.mem.Allocator, io: std.Io, set: *const Set, directory: []const u8, strict: bool) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const x = Ctx{ .a = a, .io = std.testing.io, .dir = std.mem.span(dir), .os_major = osMajor() };
+    const x = Ctx{ .a = a, .io = io, .dir = directory, .os_major = osMajor() };
     try std.Io.Dir.cwd().createDirPath(x.io, x.dir);
-    var set = try registry.build(std.testing.allocator);
-    defer set.deinit();
     var bad: usize = 0;
+    var checked: usize = 0;
+    var inconclusive: usize = 0;
     for (set.kernels.items) |k| {
         const launch_of = k.vt.launch orelse continue;
         const l = launch_of(k.ctx);
         if (!l.offline) continue;
+        if (strict and l.adapts) return error.AdaptiveLaunchNeedsFixedFallback;
         const shapes = try spec.shapes(a, k.spec);
         for (shapes) |shape| {
             const g = k.vt.geometry.?(k.ctx, shape) orelse continue;
@@ -154,14 +174,19 @@ test "kernel contract offline: each record's M1/M2 limit is what the toolchain c
             const rig = k.vt.rig(k.ctx);
             var src: std.ArrayList(u8) = .empty;
             defer src.deinit(rig.a);
+            const prior_capture = rig.capture;
             rig.capture = &src;
+            defer rig.capture = prior_capture;
             try k.vt.run(k.ctx);
             const fun = functionName(src.items) orelse return error.NoKernelName;
             const lib = try library(x, src.items);
             const m = [2]u32{ try familyLimit(x, lib, fun, &m1_archs), try familyLimit(x, lib, fun, &m2_archs) };
             const rec = l.limitsAt(shape);
             const at = .{ k.spec.name, shape.rows, shape.n, shape.k, g.threads(), m[0], m[1], rec[0], rec[1] };
+            checked += 1;
             if (m[0] == 0 or m[1] == 0) {
+                inconclusive += 1;
+                if (strict) bad += 1;
                 // Every thread request changed the build: equality cannot tell its limit.
                 std.debug.print("INCONCLUSIVE offline {s} at {d}x{d}x{d}: {d} threads; no requested build equals the plain one (recorded {d}, {d})\n", .{ k.spec.name, shape.rows, shape.n, shape.k, g.threads(), rec[0], rec[1] });
                 continue;
@@ -172,5 +197,35 @@ test "kernel contract offline: each record's M1/M2 limit is what the toolchain c
             if (!current or m[0] < 1024 or m[1] < 1024) std.debug.print("{s} offline {s} at {d}x{d}x{d}: {d} threads; M1 pipelines take {d}, M2 {d} (recorded {d}, {d})\n", .{if (current) "PASS" else "FAIL"} ++ at);
         }
     }
+    if (strict) std.debug.print("SUMMARY strict offline: {d} launch shapes, {d} inconclusive, {d} failures\n", .{ checked, inconclusive, bad });
     try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+// ── tests ──
+
+test "kernel contract offline: each record's M1/M2 limit is what the toolchain compiles" {
+    const dir = env.get(.MLX_SERVE_KERNEL_CONTRACT_OFFLINE) orelse return error.SkipZigTest;
+    if (!builtin.os.tag.isDarwin() or mlx.noGpuBackend()) return error.SkipZigTest;
+    var set = try @import("registry.zig").build(std.testing.allocator);
+    defer set.deinit();
+    try audit(std.testing.allocator, std.testing.io, &set, std.mem.span(dir));
+}
+
+// The Inkling2 affine5 Up pipeline matched 384/416, differed 448..544, then matched 576..832. A binary search that
+// sampled 512,256,128,64,32 reported no match even though the requested 64-thread launch had positive evidence.
+test "kernel contract inkling2 offline: nonmonotonic compiler matches retain positive evidence" {
+    const Compiler = struct {
+        fn matches(_: void, threads: u32) !bool {
+            return threads == 384 or threads == 416 or (threads >= 576 and threads <= 832);
+        }
+        fn none(_: void, _: u32) !bool {
+            return false;
+        }
+        fn failed(_: void, _: u32) !bool {
+            return error.CompilerFailed;
+        }
+    };
+    try std.testing.expectEqual(@as(u32, 832), try largestMatch({}, Compiler.matches));
+    try std.testing.expectEqual(@as(u32, 0), try largestMatch({}, Compiler.none));
+    try std.testing.expectError(error.CompilerFailed, largestMatch({}, Compiler.failed));
 }

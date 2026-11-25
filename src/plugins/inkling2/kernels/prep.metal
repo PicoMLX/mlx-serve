@@ -28,7 +28,8 @@ if (i < QD) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float n2 = 0.0f;
     for (uint j = 0; j < HD; j++) n2 += buf[j];
-    const float f = min(qk_thr / (sqrt(n2) + 1e-6f), 1.0f);
+    const float ratio = qk_thr / (sqrt(n2) + 1e-6f);
+    const float f = isnan(ratio) ? ratio : min(ratio, 1.0f);
     T q = T(mine * f);
     if (tau != 1.0f) q = T(float(q) * tau);
     Q[at] = q;
@@ -66,7 +67,10 @@ if (r < 2 * C) {
     for (uint j = 0; j < HD; j++) n2 += buf[j];
     const uint at = (h * ROWS + row) * HD + c % HD;
     if (is_v) V[at] = T(mine * rsqrt(n2 / float(HD) + eps));
-    else K[at] = T(mine * min(qk_thr / (sqrt(n2) + 1e-6f), 1.0f));
+    else {
+        const float ratio = qk_thr / (sqrt(n2) + 1e-6f);
+        K[at] = T(mine * (isnan(ratio) ? ratio : min(ratio, 1.0f)));
+    }
     return;
 }
 r -= 2 * C;
@@ -78,7 +82,8 @@ for (uint j = 0; j < DREL; j++) {
     const float v = float(RP[rp + j]) * float(RS[h * DREL + j]);
     n2 += v * v;
 }
-const float f = min(rel_thr / (sqrt(n2) + 1e-6f), 1.0f);
+const float ratio = rel_thr / (sqrt(n2) + 1e-6f);
+const float f = isnan(ratio) ? ratio : min(ratio, 1.0f);
 if (WIDE) {
     const uint j = r % DREL;
     REL[rp + j] = T(float(RP[rp + j]) * float(RS[h * DREL + j]) * f);
