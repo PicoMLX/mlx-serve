@@ -19,6 +19,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  converter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test Inkling converter selection and configuration
+        run: python3 -B tests/test_convert_inkling2.py -v
+
   # The Zig graph and the Swift app share nothing on disk (app/ never reads
   # zig-out), so they run as two jobs on two runners instead of one after the
   # other (#639). The Zig build and `zig build test` share no output either, so

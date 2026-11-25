@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 @testable import MLXCore
 
@@ -55,6 +56,34 @@ final class TemplateHistoryTests: XCTestCase {
         history.setCaptioned(e.id, file("late.captioned.mp4"))
         XCTAssertEqual(TemplateHistory(rootDir: dir.appendingPathComponent("store")).entries.first?.playURL.lastPathComponent,
                        "late.captioned.mp4")
+    }
+
+    func testCaptionRetryWaitsForTheCancelledJobToFinish() async {
+        _ = NSApplication.shared
+        let history = TemplateHistory(rootDir: dir.appendingPathComponent("store"))
+        let saved = TemplateHistoryEntry(template: MediaTemplate.reaction.rawValue, clip: file("retry.mp4"),
+                                        cast: [:], answers: [:], lines: [:], shape: "square", seed: 7)
+        history.add(saved)
+        let app = AppState(startServerAtLaunch: false)
+        let run = TemplateRunner(history: history)
+        run.restore(saved, cast: app.cast)
+        let finished = expectation(description: "cancelled caption job returned")
+        let completion = run.$working.dropFirst().filter { !$0 }.prefix(1).sink { _ in finished.fulfill() }
+
+        run.addCaptions(app: app)
+        XCTAssertEqual(run.phase, .captioning)
+        run.cancel()
+        XCTAssertEqual(run.phase, .done)
+        XCTAssertTrue(run.working)
+        run.addCaptions(app: app)
+        XCTAssertEqual(run.phase, .done, "a cancelled job still owns the output until its task returns")
+
+        await fulfillment(of: [finished], timeout: 2)
+        withExtendedLifetime(completion) {}
+        XCTAssertFalse(run.isBusy)
+        run.addCaptions(app: app)
+        XCTAssertEqual(run.phase, .captioning, "captions can be retried after the previous task returns")
+        run.cancel()
     }
 
     func testDeletingAVideoRemovesItsClipCaptionsGIFAndSettingsSidecar() {

@@ -262,7 +262,7 @@ final class TemplateRunner: ObservableObject {
 
     /// Captions for a finished video that has none: the speech models arrived after it was made.
     func addCaptions(app: AppState) {
-        guard let t = template, let clip, phase == .done, captioned == nil else { return }
+        guard let t = template, let clip, !isBusy, phase == .done, captioned == nil else { return }
         phase = .captioning
         start { [self] in
             await burnCaptions(clip, t, top: fill.text("top"), app: app)

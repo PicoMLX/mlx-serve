@@ -12,8 +12,9 @@ Those bytes are kept (lossless): `w13_weight` -> `gate_up_proj`, `w2_weight`
 `--bits` sets the rest of the language model, as `mlx_lm.convert -q --q-bits`
 does: the embedding, the head, the attention projections and the dynamic
 short convs' weight projections go affine at that width (group 64); 16 keeps
-them bf16. The router, the depth queries and the loop gates stay float; the
-vision tower stays bf16. The DSpark draft (`mtp.safetensors`) is copied as it is.
+them bf16 unless an endpoint override is set. The router, the depth queries
+and the loop gates stay float; the vision tower stays bf16. The DSpark draft
+(`mtp.safetensors`) is copied as it is.
 
 `--embed-bits` and `--head-bits` set those two off the `--bits` width (the attention's).
 
@@ -193,9 +194,9 @@ def quantize(weights: dict, bits: int, plan=(), overrides=None, ends=None) -> di
             if overrides is not None and width != (bits, GROUP_SIZE):
                 overrides[base] = {"group_size": width[1], "bits": width[0], "mode": "affine"}
             continue
-        if bits < 16 and QUANTIZED.match(k):
-            # The embedding and the head may sit off the `--bits` width (`ends`), listed per module path.
-            width = (ends or {}).get(base, bits)
+        # The embedding and the head may sit off the `--bits` width (`ends`), listed per module path.
+        width = (ends or {}).get(base, bits)
+        if width < 16 and QUANTIZED.match(k):
             if width != bits and overrides is not None:
                 overrides[base] = {"group_size": GROUP_SIZE, "bits": width, "mode": "affine"}
             w, scales, biases = mx.quantize(v, group_size=GROUP_SIZE, bits=width)
@@ -240,7 +241,7 @@ def main():
     src_cfg = json.loads((args.src / "config.json").read_text())
     plan = parse_experts(args.experts, src_cfg["text_config"]["num_hidden_layers"])
     overrides = {}
-    if args.bits < 16 or any(plan):
+    if args.bits < 16 or any(plan) or args.embed_bits is not None or args.head_bits is not None:
         ends = {"model.language_model.embed_tokens": args.embed_bits or args.bits, "lm_head": args.head_bits or args.bits}
         weights = quantize(weights, args.bits, plan, overrides, ends)
 
