@@ -45,6 +45,15 @@ check("github.event.pull_request.head.repo.full_name == github.repository" in jo
 
 steps = {s.get("name", ""): s for s in job["steps"]}
 
+signing = steps.get("Prepare signing", {})
+check(signing.get("id") == "signing" and "ci-signing-mode.sh" in signing.get("run", ""),
+      "signing policy is selected before certificate import")
+check("steps.signing.outputs.mode" in str(steps.get("Import signing certificate", {}).get("if", "")),
+      "certificate import requires Developer ID signing mode")
+for name in ("Package CLI binary", "Package app bundle"):
+    check(steps.get(name, {}).get("env", {}).get("SIGNING_IDENTITY") == "${{ steps.signing.outputs.identity }}",
+          f"{name} uses the selected signing identity")
+
 def step_if(name):
     check(name in steps, f"step exists: {name}")
     return str(steps.get(name, {}).get("if", ""))
@@ -122,6 +131,8 @@ check("steps.version.outputs.tag" in str(job.get("outputs", {}).get("tag", "")),
 for n in ("Notarize CLI", "Notarize app bundle"):
     check("pull_request" not in step_if(n),
           f"{n} not excluded on pull_request")
+    check("steps.signing.outputs.notarize" in step_if(n),
+          f"{n} follows the validated signing policy")
 
 mlx_serve_builds = [s for s in job["steps"]
                     if s.get("name") == "Build mlx-serve (Zig)"]
