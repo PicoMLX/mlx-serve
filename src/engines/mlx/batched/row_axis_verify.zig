@@ -844,6 +844,8 @@ test "verify rollback permits in-place KV append and restores its valid prefix" 
         }
     };
     try Eval.buffers(&cache.entries[0]);
+    // eval waits for a GPU event; completion handlers can still own these buffers. Settle them before testing donation.
+    try mlx.check(mlx.mlx_synchronize(stream));
     const before = mlx.mlx_array_data_uint32(cache.entries[0].keys) orelse return error.KvUnreadable;
     const address = @intFromPtr(before);
     var expected: [128]u32 = undefined;
