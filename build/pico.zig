@@ -22,7 +22,7 @@ const exports = [_][]const u8{
     "pico_ms_abi_version",  "pico_ms_mlx_version", "pico_ms_smoke",  "pico_ms_memory",
     "pico_ms_can_serve",    "pico_ms_load_bytes",  "pico_ms_open",   "pico_ms_close",
     "pico_ms_tokenize",     "pico_ms_detokenize",  "pico_ms_submit", "pico_ms_cancel",
-    "pico_ms_model_memory", "pico_ms_trim",
+    "pico_ms_model_memory", "pico_ms_trim", "pico_ms_build_info_v1",
 };
 
 /// mlx-c first: each archive resolves against the ones after it.
@@ -54,6 +54,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     if (builtin.os.tag != .macos or target.result.os.tag != .macos) return;
 
     const min = target.result.os.version_range.semver.min;
+    const source = @import("pico_build_info.zig").capture(b);
     // The engine's build options: one compile unit, MLX alone (no ds4, no llama.cpp, no Neural Engine), and nothing
     // that spawns a process (`mas`).
     const options = b.addOptions();
@@ -68,7 +69,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     options.addOption([]const u8, "ds4_commit", "unknown");
     options.addOption([]const u8, "llama_tag", "unknown");
     // Non-empty: the engine's build id then hashes this, not the bytes of the program that loaded the library.
-    options.addOption([]const u8, "git_sha", "pico");
+    options.addOption([]const u8, "git_sha", source.git_sha);
     options.addOption(bool, "slow_tests", false);
 
     const embedded: libs.Embedded = .init(b, target, optimize);
@@ -88,6 +89,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
             .{ .name = "webp", .module = libs.addCHeaderModule(b, b.path("src/webp_stub.h"), b.path("src"), target, optimize, "") },
         },
     });
+    mod.addOptions("pico_build_info", source.options);
     _ = libs.addExl3Module(b, mod, target, optimize);
     const obj = b.addObject(.{ .name = "pico_mlx_serve", .root_module = mod });
     obj.bundle_compiler_rt = true;
