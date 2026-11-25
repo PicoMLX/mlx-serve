@@ -2878,3 +2878,7 @@ test "kernel contract inkling2: gates 1-4 pass" {
     try std.testing.expectEqual(@as(usize, 0), t.problems());
     try std.testing.expectEqual(set.kernels.items.len, t.passed);
 }
+
+test {
+    _ = @import("contract_extended.zig");
+}

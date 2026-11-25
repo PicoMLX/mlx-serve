@@ -21,6 +21,7 @@ pub fn Pre(comptime dt: mlx.mlx_dtype, comptime msg: bool, comptime queries: usi
         pub const fallback_launch = blk: {
             var l = pre_launch;
             l.adapts = false;
+            l.offline = true;
             l.m1 = 32;
             l.m2 = 32;
             break :blk l;
@@ -217,6 +218,7 @@ pub fn Mid(comptime dt: mlx.mlx_dtype, comptime msg: bool, comptime boundary: bo
         pub const fallback_launch = blk: {
             var l = mid_launch;
             l.adapts = false;
+            l.offline = true;
             l.m1 = 32;
             l.m2 = 32;
             break :blk l;

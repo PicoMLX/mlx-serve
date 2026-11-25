@@ -138,6 +138,51 @@ pub fn register(set: *m.kc.Set) !void {
     try registrations(.normal, false, set);
 }
 
+test "kernel contract inkling2: global offline selection preserves fixed launches and explicit fallbacks" {
+    const a = std.testing.allocator;
+    var global = try @import("../../sdk/testing/kernel_contract/registry.zig").build(a);
+    defer global.deinit();
+    var normal: usize = 0;
+    var selected: usize = 0;
+    var adaptive: usize = 0;
+    for (global.kernels.items) |k| {
+        if (!std.mem.startsWith(u8, k.spec.name, "inkling2 ")) continue;
+        normal += 1;
+        const l = k.vt.launch.?(k.ctx);
+        if (l.adapts and l.m1 == 0 and l.m2 == 0) {
+            adaptive += 1;
+            try std.testing.expect(!l.offline);
+        } else {
+            selected += 1;
+            try std.testing.expect(l.offline);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 102), normal);
+    try std.testing.expectEqual(@as(usize, 24), adaptive);
+    try std.testing.expectEqual(@as(usize, 78), selected);
+
+    var fixed = m.kc.Set.init(a);
+    defer fixed.deinit();
+    try registrations(.offline, false, &fixed);
+    try std.testing.expectEqual(@as(usize, 70), fixed.kernels.items.len);
+    var fallbacks: usize = 0;
+    for (fixed.kernels.items) |k| {
+        const l = k.vt.launch.?(k.ctx);
+        try std.testing.expect(l.offline and !l.adapts and l.m1 > 0 and l.m2 > 0);
+        if (std.mem.endsWith(u8, k.spec.name, " fallback32")) {
+            fallbacks += 1;
+            try std.testing.expectEqual(@as(u32, 32), l.m1);
+            try std.testing.expectEqual(@as(u32, 32), l.m2);
+        } else {
+            const original = for (global.kernels.items) |candidate| {
+                if (std.mem.eql(u8, candidate.spec.name, k.spec.name)) break candidate;
+            } else return error.MissingFixedRegistration;
+            try std.testing.expect(original.vt.launch.?(original.ctx).offline);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 24), fallbacks);
+}
+
 test "kernel contract inkling2: added launches match the production wrappers byte for byte" {
     if (m.mlx.noGpuBackend() or m.mlx.virtualGpu() or !m.mlx.metalKernelsAvailable()) return error.SkipZigTest;
     var set = m.kc.Set.init(std.testing.allocator);

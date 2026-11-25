@@ -150,8 +150,9 @@ pub fn six(s: Shape) usize {
 }
 
 /// Fixed launches record only their required thread count, a conservative lower bound verified at every shape
-/// by the strict offline audit. Adaptive streams assert no wide pipeline cap; their terminal fallback is separate.
+/// by the strict offline audit. Adaptive streams assert no wide pipeline cap; offline auditing uses their fixed
+/// terminal fallback instead of treating an unrecorded adaptive launch as compiler-qualified.
 pub fn launch(comptime file: [:0]const u8, comptime inputs: []const [*:0]const u8, comptime outputs: []const [*:0]const u8, bytes: u32, adapts: bool) metal.Launch {
     const required: u32 = comptime if (std.mem.eql(u8, file, "prep") or std.mem.eql(u8, file, "downs")) 256 else if (std.mem.eql(u8, file, "relattn")) 128 else if (std.mem.eql(u8, file, "gate") or std.mem.eql(u8, file, "ups")) 64 else if (std.mem.eql(u8, file, "pre") or std.mem.eql(u8, file, "mid")) 0 else @compileError("record this launch's required thread count");
-    return .{ .name = "msv_inkling2_" ++ file, .inputs = inputs, .outputs = outputs, .source = @import("../../mlx/kernels.zig").source("plugins/inkling2/kernels/" ++ file ++ ".metal"), .tg_bytes = bytes, .m1 = if (adapts) 0 else required, .m2 = if (adapts) 0 else required, .adapts = adapts };
+    return .{ .name = "msv_inkling2_" ++ file, .inputs = inputs, .outputs = outputs, .source = @import("../../mlx/kernels.zig").source("plugins/inkling2/kernels/" ++ file ++ ".metal"), .tg_bytes = bytes, .m1 = if (adapts) 0 else required, .m2 = if (adapts) 0 else required, .adapts = adapts, .offline = !adapts };
 }
